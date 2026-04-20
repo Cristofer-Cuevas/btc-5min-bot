@@ -22,7 +22,8 @@ pub struct RuntimeConfig {
     pub max_ask_price: f64,
     pub max_spread: f64,
     pub bet_shares: f64,
-    pub fok_limit_price: f64,
+    pub max_slippage: f64,
+    pub min_trend_strength: f64,
 
     // Risk limits
     pub max_consecutive_losses: i64,
@@ -73,19 +74,35 @@ impl RuntimeConfig {
             .parse()
             .unwrap_or(5.0);
 
-        let fok_limit_price = {
-            let raw: f64 = env::var("FOK_LIMIT_PRICE")
-                .unwrap_or_else(|_| "0.85".into())
+        let max_slippage = {
+            let raw: f64 = env::var("MAX_SLIPPAGE")
+                .unwrap_or_else(|_| "0.03".into())
                 .parse()
-                .unwrap_or(0.85);
-            if raw > 0.05 && raw < 1.00 {
+                .unwrap_or(0.03);
+            if raw > 0.0 && raw <= 0.20 {
                 raw
             } else {
                 tracing::warn!(
-                    "FOK_LIMIT_PRICE {:.4} outside (0.05, 1.00); clamping to default 0.85",
+                    "MAX_SLIPPAGE {:.4} outside (0.0, 0.20]; clamping to default 0.03",
                     raw
                 );
-                0.85
+                0.03
+            }
+        };
+
+        let min_trend_strength = {
+            let raw: f64 = env::var("MIN_TREND_STRENGTH")
+                .unwrap_or_else(|_| "0.2".into())
+                .parse()
+                .unwrap_or(0.2);
+            if (0.0..=1.0).contains(&raw) {
+                raw
+            } else {
+                tracing::warn!(
+                    "MIN_TREND_STRENGTH {:.4} outside [0.0, 1.0]; clamping to default 0.2",
+                    raw
+                );
+                0.2
             }
         };
 
@@ -133,7 +150,8 @@ impl RuntimeConfig {
             max_ask_price,
             max_spread,
             bet_shares,
-            fok_limit_price,
+            max_slippage,
+            min_trend_strength,
             max_consecutive_losses,
             daily_loss_limit_usdc,
             poly_proxy_address,

@@ -42,10 +42,10 @@ pub fn evaluate_entry(
 
     r.trend_strength = binance.trend_strength();
     match r.trend_strength {
-        Some(strength) if strength < MIN_TREND_STRENGTH => {
+        Some(strength) if strength < config.min_trend_strength => {
             debug!(
                 "Trend strength {:.2} below {:.2}, market is choppy",
-                strength, MIN_TREND_STRENGTH
+                strength, config.min_trend_strength
             );
             r.rejection_reason = "choppy";
             return r;
@@ -140,10 +140,18 @@ pub fn evaluate_entry(
         return r;
     }
 
-    if let Some(depth) = book.ask_depth {
-        if depth < MIN_ASK_DEPTH {
+    match book.ask_depth {
+        Some(depth) if depth >= MIN_ASK_DEPTH => {
+            debug!("{} ask depth {:.0} OK", side, depth);
+        }
+        Some(depth) => {
             debug!("{} ask depth {:.0} < min {:.0}", side, depth, MIN_ASK_DEPTH);
             r.rejection_reason = "depth_low";
+            return r;
+        }
+        None => {
+            debug!("{} ask depth unknown, rejecting", side);
+            r.rejection_reason = "depth_unknown";
             return r;
         }
     }

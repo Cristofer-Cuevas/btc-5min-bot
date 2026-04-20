@@ -5,9 +5,6 @@ pub const RTDS_STALE_MS: u64 = 60_000;
 /// Maximum number of entry attempts per window before giving up.
 pub const MAX_ENTRY_ATTEMPTS: u32 = 3;
 
-/// Minimum trend strength (0.0–1.0) required to enter.
-pub const MIN_TREND_STRENGTH: f64 = 0.2;
-
 /// Minimum total size (shares) on the ask side to ensure fill.
 pub const MIN_ASK_DEPTH: f64 = 50.0;
 

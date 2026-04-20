@@ -157,15 +157,26 @@ async fn handle_update(
                 "Usage: /set_shares 10".into()
             }
         }
-        "/set_foklimit" => {
+        "/set_slippage" => {
             if let Some(val) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
-                if val <= 0.05 || val >= 1.00 {
-                    "FOK limit price must be > 0.05 and < 1.00".into()
+                if !(0.0..=0.20).contains(&val) {
+                    "Slippage must be between 0.00 and 0.20".into()
                 } else {
-                    set_param(config, db, "fok_limit_price", val).await
+                    set_param(config, db, "max_slippage", val).await
                 }
             } else {
-                "Usage: /set_foklimit 0.85".into()
+                "Usage: /set_slippage 0.03".into()
+            }
+        }
+        "/set_trend" => {
+            if let Some(val) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
+                if !(0.0..=1.0).contains(&val) {
+                    "Trend strength must be between 0.0 and 1.0".into()
+                } else {
+                    set_param(config, db, "min_trend_strength", val).await
+                }
+            } else {
+                "Usage: /set_trend 0.20".into()
             }
         }
         "/dryrun" => {
@@ -284,14 +295,16 @@ async fn build_config_display(config: &SharedConfig) -> String {
          Max ask price: ${:.2}\n\
          Max spread: ${:.2}\n\
          Bet shares: {:.0}\n\
-         FOK limit price: ${:.2}\n\
+         Max slippage: ${:.2}\n\
+         Min trend strength: {:.2}\n\
          Dry run: {}\n\
          Has credentials: {}",
         cfg.btc_threshold_pct,
         cfg.max_ask_price,
         cfg.max_spread,
         cfg.bet_shares,
-        cfg.fok_limit_price,
+        cfg.max_slippage,
+        cfg.min_trend_strength,
         cfg.dry_run,
         cfg.has_trading_credentials(),
     )
@@ -325,9 +338,14 @@ async fn set_param(config: &SharedConfig, db: &Arc<Database>, param: &str, val: 
             cfg.bet_shares = val;
             old
         }
-        "fok_limit_price" => {
-            let old = cfg.fok_limit_price;
-            cfg.fok_limit_price = val;
+        "max_slippage" => {
+            let old = cfg.max_slippage;
+            cfg.max_slippage = val;
+            old
+        }
+        "min_trend_strength" => {
+            let old = cfg.min_trend_strength;
+            cfg.min_trend_strength = val;
             old
         }
         _ => return format!("Unknown parameter: {}", param),

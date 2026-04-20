@@ -60,7 +60,7 @@ pub async fn build_shared_sdk_client(
     Ok(Arc::new(authenticated))
 }
 
-/// Place a Fill-or-Kill market buy order at the configured FOK limit price.
+/// Place a Fill-or-Kill market buy order at a limit pegged to the observed ask + max_slippage.
 #[allow(clippy::too_many_arguments)]
 pub async fn place_fok_buy(
     sdk_client: &AuthedSdkClient,
@@ -71,9 +71,11 @@ pub async fn place_fok_buy(
     tick_size: &str,
     neg_risk: bool,
 ) -> Result<FillResult, String> {
-    let price = (config.fok_limit_price * 100.0).round() / 100.0;
+    let raw = signal.ask_price + config.max_slippage;
+    let limit = (raw * 100.0).round() / 100.0;
+    let limit = limit.clamp(0.02, 0.99);
 
-    place_fok_buy_raw(sdk_client, config, wallet, signal, price, shares, tick_size, neg_risk).await
+    place_fok_buy_raw(sdk_client, config, wallet, signal, limit, shares, tick_size, neg_risk).await
 }
 
 /// Place a Fill-or-Kill market buy order at an exact limit price (no slippage adjustment).

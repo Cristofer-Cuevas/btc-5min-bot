@@ -401,7 +401,11 @@ async fn main() {
                 )
             };
 
-            let limit_price = (cfg.fok_limit_price * 100.0).round() / 100.0;
+            let limit_price = {
+                let raw = signal.ask_price + cfg.max_slippage;
+                let tick = (raw * 100.0).round() / 100.0;
+                tick.clamp(0.02, 0.99)
+            };
 
             let failed_before = {
                 let ws = window_state.read().await;
