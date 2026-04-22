@@ -17,6 +17,16 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::time::FormatTime;
+
+struct EtTimer;
+
+impl FormatTime for EtTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Utc::now().with_timezone(&chrono_tz::America::New_York);
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S %Z"))
+    }
+}
 
 use crate::constants::*;
 use crate::db::Database;
@@ -43,6 +53,7 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level)),
         )
+        .with_timer(EtTimer)
         .init();
 
     info!("Polymarket BTC 5-min bot starting (version {})", BOT_VERSION);

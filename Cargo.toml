@@ -1,5 +1,5 @@
 [package]
-name = "polymarket-bot"
+name = "btc-5min-bot"
 version = "0.1.0"
 edition = "2021"
 
@@ -20,6 +20,7 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 chrono = "0.4"
+chrono-tz = "0.9"
 hex = "0.4"
 rand = "0.8"
 polymarket-client-sdk = { version = "0.4", features = ["clob"] }
