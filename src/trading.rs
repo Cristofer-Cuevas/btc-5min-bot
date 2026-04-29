@@ -45,7 +45,7 @@ pub async fn build_shared_sdk_client(
         config.poly_proxy_address.parse()
             .map_err(|e| format!("Invalid proxy address: {}", e))?;
 
-    let sdk_client = SdkClient::new("https://clob-v2.polymarket.com", SdkConfig::default())
+    let sdk_client = SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
         .map_err(|e| format!("SDK client init: {}", e))?;
 
     let authenticated = sdk_client

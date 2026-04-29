@@ -92,7 +92,7 @@ impl RuntimeConfig {
 
         let min_trend_strength = {
             let raw: f64 = env::var("MIN_TREND_STRENGTH")
-                .unwrap_or_else(|_| "0.4".into())
+                .unwrap_or_else(|_| "0.41".into())
                 .parse()
                 .unwrap_or(0.2);
             if (0.0..=1.0).contains(&raw) {

@@ -374,7 +374,7 @@ async fn main() {
             // Capture market snapshot for the trade record
             let (
                 bid_price_observed, ask_depth_val, bid_depth_val,
-                up_tc, down_tc, opposite_side_ask, neg_risk_val,
+                up_tc, down_tc, opposite_side_ask, neg_risk_val, tick_size_val,
             ) = {
                 let ws = window_state.read().await;
                 let ms = market_state.read().await;
@@ -392,6 +392,7 @@ async fn main() {
                     ms.down_trade_count,
                     opposite_book.best_ask,
                     market.neg_risk,
+                    market.tick_size.clone(),
                 )
             };
 
@@ -428,8 +429,6 @@ async fn main() {
             let fill = if dry_run {
                 trading::simulate_trade(signal, shares)
             } else {
-                let ws = window_state.read().await;
-                let market = ws.market.as_ref().unwrap();
                 let sdk = sdk_client.as_ref().expect("SDK client required for live trading");
                 match trading::place_fok_buy(
                     sdk,
@@ -437,21 +436,22 @@ async fn main() {
                     &wallet,
                     signal,
                     shares,
-                    &market.tick_size,
-                    market.neg_risk,
+                    &tick_size_val,
+                    neg_risk_val,
                 )
                 .await
                 {
                     Ok(fill) => fill,
                     Err(e) => {
                         error!("Order placement failed: {}", e);
-                        {
+                        let max_reached = {
                             let mut ws = window_state.write().await;
                             ws.failed_attempts += 1;
-                            if ws.failed_attempts >= MAX_ENTRY_ATTEMPTS {
-                                warn!("Max entry attempts ({}) reached for window {}", MAX_ENTRY_ATTEMPTS, current_ts);
-                                telegram::notify(&shared_config, &format!("⚠️ Max retries reached for window {}", current_ts)).await;
-                            }
+                            ws.failed_attempts >= MAX_ENTRY_ATTEMPTS
+                        };
+                        if max_reached {
+                            warn!("Max entry attempts ({}) reached for window {}", MAX_ENTRY_ATTEMPTS, current_ts);
+                            telegram::notify(&shared_config, &format!("⚠️ Max retries reached for window {}", current_ts)).await;
                         }
                         let failed_signal = EvaluationResult {
                             rejection_reason: "failed_fok",
@@ -472,13 +472,14 @@ async fn main() {
             // If FOK didn't fill, don't record a trade
             if fill.filled_size == 0.0 {
                 warn!("FOK order {} did not fill, not recording trade", fill.order_id);
-                {
+                let max_reached = {
                     let mut ws = window_state.write().await;
                     ws.failed_attempts += 1;
-                    if ws.failed_attempts >= MAX_ENTRY_ATTEMPTS {
-                        warn!("Max entry attempts ({}) reached for window {}", MAX_ENTRY_ATTEMPTS, current_ts);
-                        telegram::notify(&shared_config, &format!("⚠️ Max retries reached for window {}", current_ts)).await;
-                    }
+                    ws.failed_attempts >= MAX_ENTRY_ATTEMPTS
+                };
+                if max_reached {
+                    warn!("Max entry attempts ({}) reached for window {}", MAX_ENTRY_ATTEMPTS, current_ts);
+                    telegram::notify(&shared_config, &format!("⚠️ Max retries reached for window {}", current_ts)).await;
                 }
                 let unmatched_signal = EvaluationResult {
                     rejection_reason: "unmatched_fok",
