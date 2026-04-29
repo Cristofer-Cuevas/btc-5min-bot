@@ -23,7 +23,7 @@ chrono = "0.4"
 chrono-tz = "0.9"
 hex = "0.4"
 rand = "0.8"
-polymarket-client-sdk = { version = "0.4", features = ["clob"] }
+polymarket_client_sdk_v2 = { version = "0.5", features = ["clob"] }
 alloy = { version = "1", features = ["signers", "signer-local"] }
 rust_decimal = "1"
 rust_decimal_macros = "1"

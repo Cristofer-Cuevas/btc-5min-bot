@@ -1194,6 +1194,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "btc-5min-bot"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "dotenvy",
+ "ethers",
+ "futures-util",
+ "hex",
+ "hmac",
+ "polymarket_client_sdk_v2",
+ "rand 0.8.5",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "sha2",
+ "teloxide",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1362,6 +1391,28 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "chrono-tz"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93698b29de5e97ad0ae26447b344c482a7284c737d9ddc5f9e52b74a336671bb"
+dependencies = [
+ "chrono",
+ "chrono-tz-build",
+ "phf 0.11.3",
+]
+
+[[package]]
+name = "chrono-tz-build"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c088aee841df9c3041febbb73934cfc39708749bf96dc827e3359cd39ef11b1"
+dependencies = [
+ "parse-zoneinfo",
+ "phf 0.11.3",
+ "phf_codegen",
 ]
 
 [[package]]
@@ -3923,6 +3974,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "parse-zoneinfo"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f2a05b18d44e2957b88f96ba460715e295bc1d7510468a2f3d3b44535d26c24"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "password-hash"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4031,6 +4091,16 @@ dependencies = [
  "phf_macros 0.13.1",
  "phf_shared 0.13.1",
  "serde",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
+dependencies = [
+ "phf_generator 0.11.3",
+ "phf_shared 0.11.3",
 ]
 
 [[package]]
@@ -4146,38 +4216,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "polymarket-bot"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "base64 0.22.1",
- "chrono",
- "dotenvy",
- "ethers",
- "futures-util",
- "hex",
- "hmac",
- "polymarket-client-sdk",
- "rand 0.8.5",
- "reqwest 0.12.28",
- "rusqlite",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "sha2",
- "teloxide",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "polymarket-client-sdk"
-version = "0.4.4"
+name = "polymarket_client_sdk_v2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0852dbe6df78c4964452d6071abdc7ec0f649042c76733a075cb79e322745eaa"
+checksum = "594de0bf0e129e266946f02acbf579253951afbbee92fc1564da3c9179303aea"
 dependencies = [
  "alloy",
  "async-stream",
@@ -4199,6 +4241,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_with 3.18.0",
+ "sha1",
  "sha2",
  "strum_macros 0.28.0",
  "url",

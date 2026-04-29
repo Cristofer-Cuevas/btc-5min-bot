@@ -4,12 +4,12 @@ use std::sync::Arc;
 use alloy::signers::Signer as _;
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use chrono::Utc;
-use polymarket_client_sdk::auth::{Credentials, Uuid};
-use polymarket_client_sdk::clob::types::{
+use polymarket_client_sdk_v2::auth::{Credentials, Uuid};
+use polymarket_client_sdk_v2::clob::types::{
     OrderType, Side, SignatureType, TickSize,
 };
-use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::clob::{Client as SdkClient, Config as SdkConfig};
+use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal::Decimal;
 use tracing::{debug, info};
 
@@ -18,7 +18,7 @@ use crate::types::{EntrySignal, FillResult};
 
 /// Authenticated SDK client type (post-.authenticate()).
 pub type AuthedSdkClient =
-    SdkClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>;
+    SdkClient<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>;
 
 fn parse_tick_size(s: &str) -> Result<TickSize, String> {
     let d = Decimal::from_str(s).map_err(|e| format!("Invalid tick size '{}': {}", s, e))?;
@@ -41,11 +41,11 @@ pub async fn build_shared_sdk_client(
         config.poly_api_passphrase.clone(),
     );
 
-    let funder: polymarket_client_sdk::types::Address =
+    let funder: polymarket_client_sdk_v2::types::Address =
         config.poly_proxy_address.parse()
             .map_err(|e| format!("Invalid proxy address: {}", e))?;
 
-    let sdk_client = SdkClient::new("https://clob.polymarket.com", SdkConfig::default())
+    let sdk_client = SdkClient::new("https://clob-v2.polymarket.com", SdkConfig::default())
         .map_err(|e| format!("SDK client init: {}", e))?;
 
     let authenticated = sdk_client
@@ -143,7 +143,7 @@ pub async fn place_fok_buy_raw(
         return Err(format!("Order rejected: status={}", resp.status));
     }
 
-    use polymarket_client_sdk::clob::types::OrderStatusType;
+    use polymarket_client_sdk_v2::clob::types::OrderStatusType;
     if resp.status == OrderStatusType::Unmatched {
         info!("FOK order {} was not filled", resp.order_id);
         return Ok(FillResult {
