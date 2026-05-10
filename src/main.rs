@@ -430,7 +430,7 @@ async fn main() {
                 trading::simulate_trade(signal, shares)
             } else {
                 let sdk = sdk_client.as_ref().expect("SDK client required for live trading");
-                match trading::place_fok_buy(
+                match trading::place_fak_buy(
                     sdk,
                     &cfg,
                     &wallet,
@@ -454,7 +454,7 @@ async fn main() {
                             telegram::notify(&shared_config, &format!("⚠️ Max retries reached for window {}", current_ts)).await;
                         }
                         let failed_signal = EvaluationResult {
-                            rejection_reason: "failed_fok",
+                            rejection_reason: "failed_fak",
                             signal: None,
                             ..eval_result.clone()
                         };
@@ -469,9 +469,10 @@ async fn main() {
 
             let order_ack_ms = chrono::Utc::now().timestamp_millis();
 
-            // If FOK didn't fill, don't record a trade
+            // If FAK didn't fill at all (zero shares), don't record a trade.
+            // Any partial fill (filled_size > 0) flows through normal recording below.
             if fill.filled_size == 0.0 {
-                warn!("FOK order {} did not fill, not recording trade", fill.order_id);
+                warn!("FAK order {} did not fill, not recording trade", fill.order_id);
                 let max_reached = {
                     let mut ws = window_state.write().await;
                     ws.failed_attempts += 1;
@@ -482,12 +483,12 @@ async fn main() {
                     telegram::notify(&shared_config, &format!("⚠️ Max retries reached for window {}", current_ts)).await;
                 }
                 let unmatched_signal = EvaluationResult {
-                    rejection_reason: "unmatched_fok",
+                    rejection_reason: "unmatched_fak",
                     signal: None,
                     ..eval_result
                 };
                 db.insert_signal(&unmatched_signal, current_ts as i64, secs_left, dry_run);
-                let msg = format!("⚠️ FOK not filled (order {})", fill.order_id);
+                let msg = format!("⚠️ FAK not filled (order {})", fill.order_id);
                 telegram::notify(&shared_config, &msg).await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;

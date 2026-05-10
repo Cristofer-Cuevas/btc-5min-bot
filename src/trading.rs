@@ -60,9 +60,9 @@ pub async fn build_shared_sdk_client(
     Ok(Arc::new(authenticated))
 }
 
-/// Place a Fill-or-Kill market buy order at a limit pegged to the observed ask + max_slippage.
+/// Place a Fill-and-Kill market buy order at a limit pegged to the observed ask + max_slippage.
 #[allow(clippy::too_many_arguments)]
-pub async fn place_fok_buy(
+pub async fn place_fak_buy(
     sdk_client: &AuthedSdkClient,
     config: &RuntimeConfig,
     wallet: &PrivateKeySigner,
@@ -75,12 +75,12 @@ pub async fn place_fok_buy(
     let limit = (raw * 100.0).round() / 100.0;
     let limit = limit.clamp(0.02, 0.99);
 
-    place_fok_buy_raw(sdk_client, config, wallet, signal, limit, shares, tick_size, neg_risk).await
+    place_fak_buy_raw(sdk_client, config, wallet, signal, limit, shares, tick_size, neg_risk).await
 }
 
-/// Place a Fill-or-Kill market buy order at an exact limit price (no slippage adjustment).
+/// Place a Fill-and-Kill market buy order at an exact limit price (no slippage adjustment).
 #[allow(clippy::too_many_arguments)]
-pub async fn place_fok_buy_raw(
+pub async fn place_fak_buy_raw(
     sdk_client: &AuthedSdkClient,
     _config: &RuntimeConfig,
     wallet: &PrivateKeySigner,
@@ -92,7 +92,7 @@ pub async fn place_fok_buy_raw(
 ) -> Result<FillResult, String> {
     let cost = price * shares;
     info!(
-        "Placing FOK BUY: {} {} shares @ ${:.2} (cost ${:.2})",
+        "Placing FAK BUY: {} {} shares @ ${:.2} (cost ${:.2})",
         signal.side, shares, price, cost
     );
 
@@ -114,7 +114,7 @@ pub async fn place_fok_buy_raw(
         .side(Side::Buy)
         .price(dec_price)
         .size(dec_shares)
-        .order_type(OrderType::FOK)
+        .order_type(OrderType::FAK)
         .build()
         .await
         .map_err(|e| format!("SDK build order: {}", e))?;
@@ -145,7 +145,7 @@ pub async fn place_fok_buy_raw(
 
     use polymarket_client_sdk_v2::clob::types::OrderStatusType;
     if resp.status == OrderStatusType::Unmatched {
-        info!("FOK order {} was not filled", resp.order_id);
+        info!("FAK order {} was not filled", resp.order_id);
         return Ok(FillResult {
             order_id: resp.order_id,
             fill_price: 0.0,
@@ -161,10 +161,17 @@ pub async fn place_fok_buy_raw(
         price
     };
 
-    info!(
-        "Order {} filled: {:.2} shares @ ${:.4}",
-        resp.order_id, filled_size, fill_price
-    );
+    if filled_size > 0.0 && filled_size < shares * 0.99 {
+        info!(
+            "FAK partial fill: requested {:.2} shares, filled {:.2} ({:.1}% of target) @ ${:.4} avg",
+            shares, filled_size, (filled_size / shares) * 100.0, fill_price
+        );
+    } else {
+        info!(
+            "Order {} filled: {:.2} shares @ ${:.4}",
+            resp.order_id, filled_size, fill_price
+        );
+    }
     Ok(FillResult {
         order_id: resp.order_id,
         fill_price,
@@ -175,7 +182,7 @@ pub async fn place_fok_buy_raw(
 /// Simulate a trade for dry-run mode. Returns a FillResult with simulated values.
 pub fn simulate_trade(signal: &EntrySignal, shares: f64) -> FillResult {
     info!(
-        "[DRY RUN] Simulated FOK BUY: {} {} shares @ ${:.2}",
+        "[DRY RUN] Simulated FAK BUY: {} {} shares @ ${:.2}",
         signal.side, shares, signal.ask_price
     );
     FillResult {

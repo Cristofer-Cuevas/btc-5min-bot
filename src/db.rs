@@ -126,7 +126,9 @@ impl Database {
             -- rejection_reason values:
             --   entered, below_threshold, choppy, rtds_mismatch, ask_too_high,
             --   ask_too_low, spread_wide, trade_count_low, depth_low, too_late,
-            --   too_early, market_resolved, max_attempts, failed_fok, unmatched_fok
+            --   too_early, market_resolved, max_attempts, failed_fak, unmatched_fak,
+            --   depth_unknown, trend_unavailable
+            --   (historical rows may also contain failed_fok / unmatched_fok)
             CREATE TABLE IF NOT EXISTS signals (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_ms    INTEGER NOT NULL,

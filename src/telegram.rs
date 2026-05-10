@@ -428,7 +428,7 @@ async fn build_testorder(
         None => return "SDK client not available (dry-run mode or no credentials)".into(),
     };
 
-    match trading::place_fok_buy_raw(
+    match trading::place_fak_buy_raw(
         sdk, &cfg, wallet, &signal, price, shares, "0.01", false,
     )
     .await
