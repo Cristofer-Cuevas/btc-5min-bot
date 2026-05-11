@@ -231,6 +231,8 @@ async fn main() {
                 ws.last_signal_reason = None;
                 ws.market = None;
                 ws.next_window_prefetched = false;
+                ws.pending_retry_signal = None;
+                ws.last_attempt_failed_at_ms = None;
             }
 
             // Reset market state
@@ -309,10 +311,112 @@ async fn main() {
             }
         }
 
-        // ── Strategy evaluation ──
-        let signal_detected_ms = chrono::Utc::now().timestamp_millis();
+        // ── Retry check (before strategy evaluation) ──
+        // If a prior attempt left a pending retry signal and conditions allow,
+        // build a refreshed signal from CURRENT book state and use it instead
+        // of running strategy. Retry takes precedence over strategy evaluation.
+        let retry_signal_opt: Option<EntrySignal> = {
+            let pending = {
+                let ws = window_state.read().await;
+                ws.pending_retry_signal.clone()
+            };
+            if let Some(pending) = pending {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let (cooldown_elapsed, attempts, entered, paused) = {
+                    let ws = window_state.read().await;
+                    let cooldown_elapsed = match ws.last_attempt_failed_at_ms {
+                        Some(t) => now_ms - t >= 3000,
+                        None => true,
+                    };
+                    (cooldown_elapsed, ws.failed_attempts, ws.entered, ws.paused)
+                };
+                let resolved = market_state.read().await.resolved;
 
-        let (eval_result, dry_run_flag) = {
+                let can_retry = cooldown_elapsed
+                    && secs_left >= 30
+                    && attempts < MAX_ENTRY_ATTEMPTS
+                    && !entered
+                    && !paused
+                    && !resolved;
+
+                if !can_retry {
+                    if attempts >= MAX_ENTRY_ATTEMPTS {
+                        warn!(
+                            "Retry budget exhausted ({}), abandoning entry for window {}",
+                            MAX_ENTRY_ATTEMPTS, current_ts
+                        );
+                        let mut ws = window_state.write().await;
+                        ws.pending_retry_signal = None;
+                    }
+                    None
+                } else {
+                    // Re-derive limit price from CURRENT book — ask may have moved.
+                    let (current_ask_opt, current_spread) = {
+                        let ms = market_state.read().await;
+                        let book = if pending.side == "Up" {
+                            &ms.up_book
+                        } else {
+                            &ms.down_book
+                        };
+                        (book.best_ask, book.spread().unwrap_or(0.0))
+                    };
+                    let max_ask_price = shared_config.read().await.max_ask_price;
+
+                    match current_ask_opt {
+                        None => None, // book has no ask this tick; try next tick
+                        Some(ask) if ask >= max_ask_price => {
+                            info!(
+                                "Retry abandoned: market moved past MAX_ASK_PRICE ({:.2} >= {:.2})",
+                                ask, max_ask_price
+                            );
+                            let mut ws = window_state.write().await;
+                            ws.pending_retry_signal = None;
+                            None
+                        }
+                        Some(ask) => {
+                            info!(
+                                "Retrying entry (attempt {}/{}): {} @ current ask ${:.2}",
+                                attempts + 1,
+                                MAX_ENTRY_ATTEMPTS,
+                                pending.side,
+                                ask
+                            );
+                            Some(EntrySignal {
+                                side: pending.side.clone(),
+                                token_id: pending.token_id.clone(),
+                                btc_delta_pct: pending.btc_delta_pct,
+                                ask_price: ask,
+                                spread: current_spread,
+                                secs_left,
+                            })
+                        }
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        // ── Strategy evaluation (skipped if retry took precedence) ──
+        let signal_detected_ms = chrono::Utc::now().timestamp_millis();
+        let is_retry = retry_signal_opt.is_some();
+
+        let (eval_result, dry_run_flag) = if let Some(retry_sig) = retry_signal_opt {
+            let dry_run = shared_config.read().await.dry_run;
+            let r = EvaluationResult {
+                signal: Some(retry_sig.clone()),
+                rejection_reason: "entered",
+                btc_delta_pct: Some(retry_sig.btc_delta_pct),
+                ask_price: Some(retry_sig.ask_price),
+                bid_price: None,
+                spread: Some(retry_sig.spread),
+                ask_depth: None,
+                trade_count: None,
+                trend_strength: None,
+                side: Some(retry_sig.side),
+            };
+            (r, dry_run)
+        } else {
             let ws = window_state.read().await;
             let cfg = shared_config.read().await;
             let btc = btc_price.read().await;
@@ -362,10 +466,12 @@ async fn main() {
         }
 
         if let Some(ref signal) = eval_result.signal {
-            info!(
-                "ENTRY SIGNAL: {} | BTC Δ: {:+.4}% | Ask: ${:.2} | Spread: ${:.2} | {}s left",
-                signal.side, signal.btc_delta_pct, signal.ask_price, signal.spread, signal.secs_left
-            );
+            if !is_retry {
+                info!(
+                    "ENTRY SIGNAL: {} | BTC Δ: {:+.4}% | Ask: ${:.2} | Spread: ${:.2} | {}s left",
+                    signal.side, signal.btc_delta_pct, signal.ask_price, signal.spread, signal.secs_left
+                );
+            }
 
             let cfg = shared_config.read().await;
             let shares = cfg.bet_shares;
@@ -444,9 +550,17 @@ async fn main() {
                     Ok(fill) => fill,
                     Err(e) => {
                         error!("Order placement failed: {}", e);
+                        let retriable = trading::is_retriable_error(&e);
+                        let now_ms = chrono::Utc::now().timestamp_millis();
                         let max_reached = {
                             let mut ws = window_state.write().await;
                             ws.failed_attempts += 1;
+                            ws.last_attempt_failed_at_ms = Some(now_ms);
+                            if retriable && ws.failed_attempts < MAX_ENTRY_ATTEMPTS {
+                                ws.pending_retry_signal = Some(signal.clone());
+                            } else {
+                                ws.pending_retry_signal = None;
+                            }
                             ws.failed_attempts >= MAX_ENTRY_ATTEMPTS
                         };
                         if max_reached {
@@ -473,9 +587,16 @@ async fn main() {
             // Any partial fill (filled_size > 0) flows through normal recording below.
             if fill.filled_size == 0.0 {
                 warn!("FAK order {} did not fill, not recording trade", fill.order_id);
+                let now_ms = chrono::Utc::now().timestamp_millis();
                 let max_reached = {
                     let mut ws = window_state.write().await;
                     ws.failed_attempts += 1;
+                    ws.last_attempt_failed_at_ms = Some(now_ms);
+                    if ws.failed_attempts < MAX_ENTRY_ATTEMPTS {
+                        ws.pending_retry_signal = Some(signal.clone());
+                    } else {
+                        ws.pending_retry_signal = None;
+                    }
                     ws.failed_attempts >= MAX_ENTRY_ATTEMPTS
                 };
                 if max_reached {
@@ -542,10 +663,20 @@ async fn main() {
 
             db.insert_signal(&eval_result, current_ts as i64, secs_left, dry_run);
 
-            // Mark entered
+            // Mark entered, clear any pending retry intent
             {
                 let mut ws = window_state.write().await;
                 ws.entered = true;
+                ws.pending_retry_signal = None;
+            }
+
+            if is_retry {
+                let attempts = window_state.read().await.failed_attempts;
+                info!(
+                    "Retry filled on attempt {}/{}",
+                    attempts + 1,
+                    MAX_ENTRY_ATTEMPTS
+                );
             }
 
             // Notify Telegram

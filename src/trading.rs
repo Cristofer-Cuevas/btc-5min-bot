@@ -20,6 +20,14 @@ use crate::types::{EntrySignal, FillResult};
 pub type AuthedSdkClient =
     SdkClient<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>;
 
+/// Whether a place-order error string represents a transient FOK/FAK rejection
+/// that's safe to retry. Network/protocol errors (500s, version mismatches) are not.
+pub fn is_retriable_error(msg: &str) -> bool {
+    msg.contains("FOK orders are fully filled")
+        || msg.contains("no orders found to match")
+        || msg.contains("FAK orders are partially filled")
+}
+
 fn parse_tick_size(s: &str) -> Result<TickSize, String> {
     let d = Decimal::from_str(s).map_err(|e| format!("Invalid tick size '{}': {}", s, e))?;
     TickSize::try_from(d).map_err(|e| format!("{}", e))

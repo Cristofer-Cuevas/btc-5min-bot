@@ -105,6 +105,8 @@ pub struct WindowState {
     pub failed_attempts: u32,
     pub last_signal_reason: Option<String>,
     pub next_window_prefetched: bool,
+    pub pending_retry_signal: Option<EntrySignal>,
+    pub last_attempt_failed_at_ms: Option<i64>,
 }
 
 // ── Trade Record (for DB) ──
