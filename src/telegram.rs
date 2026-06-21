@@ -129,6 +129,7 @@ async fn handle_update(
     let command = parts.first().copied().unwrap_or("");
 
     let response = match command {
+        "/help" | "/start" => build_help(),
         "/status" => build_status(config, btc_price, window_state, start_time).await,
         "/stats" => build_stats(db).await,
         "/config" => build_config_display(config).await,
@@ -144,6 +145,17 @@ async fn handle_update(
                 set_param(config, db, "max_ask_price", val).await
             } else {
                 "Usage: /set_maxask 0.80".into()
+            }
+        }
+        "/set_spread" => {
+            if let Some(val) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
+                if !(0.0..=1.0).contains(&val) {
+                    "Max spread must be between 0.00 and 1.00".into()
+                } else {
+                    set_param(config, db, "max_spread", val).await
+                }
+            } else {
+                "Usage: /set_spread 0.15".into()
             }
         }
         "/set_shares" => {
@@ -287,6 +299,31 @@ async fn build_stats(db: &Arc<Database>) -> String {
     )
 }
 
+fn build_help() -> String {
+    "<b>Commands</b>\n\
+     /help — this list\n\
+     /status — window, BTC price, position, uptime\n\
+     /stats — today / week / all-time P&amp;L\n\
+     /config — current strategy params\n\
+     /limits — risk limits (consec losses, daily cap)\n\
+     /last [N] — last N trades (default 5)\n\
+     \n\
+     <b>Parameters</b>\n\
+     /set_threshold &lt;pct&gt; — BTC delta threshold (e.g. 0.08)\n\
+     /set_maxask &lt;price&gt; — max ask to enter (e.g. 0.80)\n\
+     /set_spread &lt;val&gt; — max bid-ask spread (e.g. 0.15)\n\
+     /set_shares &lt;n&gt; — bet size in shares (min 5)\n\
+     /set_slippage &lt;val&gt; — limit = ask + slippage (0.00–0.20)\n\
+     /set_trend &lt;val&gt; — min trend strength (0.0–1.0)\n\
+     \n\
+     <b>Control</b>\n\
+     /pause — stop entering new trades\n\
+     /resume — resume trading\n\
+     /dryrun on|off — toggle dry-run mode\n\
+     /testorder &lt;token_id&gt; &lt;price&gt; &lt;shares&gt; — fire a test FAK order"
+        .into()
+}
+
 async fn build_config_display(config: &SharedConfig) -> String {
     let cfg = config.read().await;
     format!(
@@ -331,6 +368,11 @@ async fn set_param(config: &SharedConfig, db: &Arc<Database>, param: &str, val: 
         "max_ask_price" => {
             let old = cfg.max_ask_price;
             cfg.max_ask_price = val;
+            old
+        }
+        "max_spread" => {
+            let old = cfg.max_spread;
+            cfg.max_spread = val;
             old
         }
         "bet_shares" => {

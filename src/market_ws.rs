@@ -209,7 +209,7 @@ async fn handle_clob_message(
                 };
                 book.best_bid = best_price(&msg.bids, true);
                 book.best_ask = best_price(&msg.asks, false);
-                
+
                 // ADD: compute total depth
                 book.ask_depth = msg.asks.as_ref().map(|levels| {
                     levels.iter()
@@ -221,6 +221,21 @@ async fn handle_clob_message(
                         .filter_map(|l| l.size.parse::<f64>().ok())
                         .sum()
                 });
+
+                // Full ask ladder sorted ascending by price, for fillable-depth
+                // queries (ask_depth_up_to). Cleared and rebuilt on every book
+                // snapshot; not maintained between snapshots.
+                book.ask_levels = msg.asks.as_ref().map(|levels| {
+                    let mut v: Vec<(f64, f64)> = levels.iter()
+                        .filter_map(|l| {
+                            let p = l.price.parse::<f64>().ok()?;
+                            let s = l.size.parse::<f64>().ok()?;
+                            Some((p, s))
+                        })
+                        .collect();
+                    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    v
+                }).unwrap_or_default();
             }
             "price_change" => {
                 let mut state = market_state.write().await;
@@ -229,6 +244,9 @@ async fn handle_clob_message(
                 } else {
                     &mut state.down_book
                 };
+                // NOTE: best_bid/best_ask are refreshed here, but ask_levels
+                // (and ask_depth) are NOT — they only update on full `book`
+                // snapshots, so the ladder may lag best_ask between snapshots.
                 if let Some(ref bid) = msg.best_bid {
                     book.best_bid = bid.parse().ok();
                 }

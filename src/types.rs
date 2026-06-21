@@ -22,6 +22,9 @@ pub struct TokenBook {
     pub last_trade_price: Option<f64>,
     pub ask_depth: Option<f64>,
     pub bid_depth: Option<f64>,
+    /// Full ask ladder from the most recent `book` snapshot, sorted ascending
+    /// by price. Stale between snapshots (not rebuilt on price_change events).
+    pub ask_levels: Vec<(f64, f64)>,
 }
 
 impl TokenBook {
@@ -30,6 +33,17 @@ impl TokenBook {
             (Some(bid), Some(ask)) => Some(ask - bid),
             _ => None,
         }
+    }
+
+    /// Total shares available at prices <= max_price (fillable depth up to a
+    /// limit). Returns 0.0 if no levels or none qualify — that's intentional
+    /// fail-closed behavior: an empty/unpopulated ladder fails the depth gate.
+    pub fn ask_depth_up_to(&self, max_price: f64) -> f64 {
+        self.ask_levels
+            .iter()
+            .filter(|(price, _)| *price <= max_price + 1e-9)
+            .map(|(_, size)| size)
+            .sum()
     }
 }
 
@@ -63,8 +77,19 @@ pub struct BinanceBtcPrice {
 }
 
 impl BinanceBtcPrice {
-    /// Returns Some(strength) where strength is 0.0–1.0, or None if insufficient samples.
+    /// Returns Some(strength) where strength is 0.0–1.0, or None if insufficient samples
+    /// OR if the buffer spans less than 90 seconds of real time.
     pub fn trend_strength(&self) -> Option<f64> {
+        // Need a real time span, not just a sample count. A cold buffer
+        // (e.g. right after a Binance reconnect) can hold many ticks over
+        // only a few seconds, which trivially scores ~1.0 and defeats the
+        // choppiness filter. Require >= 90s of actual elapsed data.
+        let front_ts = self.price_buffer.front()?.0;
+        let back_ts = self.price_buffer.back()?.0;
+        if back_ts.saturating_sub(front_ts) < 90_000 {
+            return None;
+        }
+
         if self.price_buffer.len() < crate::constants::MIN_TREND_SAMPLES {
             return None;
         }

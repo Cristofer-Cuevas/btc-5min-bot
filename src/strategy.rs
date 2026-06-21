@@ -140,21 +140,20 @@ pub fn evaluate_entry(
         return r;
     }
 
-    match book.ask_depth {
-        Some(depth) if depth >= MIN_ASK_DEPTH => {
-            debug!("{} ask depth {:.0} OK", side, depth);
-        }
-        Some(depth) => {
-            debug!("{} ask depth {:.0} < min {:.0}", side, depth, MIN_ASK_DEPTH);
-            r.rejection_reason = "depth_low";
-            return r;
-        }
-        None => {
-            debug!("{} ask depth unknown, rejecting", side);
-            r.rejection_reason = "depth_unknown";
-            return r;
-        }
+    // Fillable depth at our actual limit, not total book depth. Total depth
+    // is misleading — size resting above our limit can't fill our order.
+    // An empty/unpopulated ladder returns 0.0 and correctly fails this gate.
+    let limit_price = ask_price + config.max_slippage;
+    let fillable = book.ask_depth_up_to(limit_price);
+    if fillable < MIN_ASK_DEPTH {
+        debug!(
+            "{} fillable depth {:.0} at limit ${:.2} < min {:.0}",
+            side, fillable, limit_price, MIN_ASK_DEPTH
+        );
+        r.rejection_reason = "depth_low";
+        return r;
     }
+    debug!("{} fillable depth {:.0} at limit ${:.2} OK", side, fillable, limit_price);
 
     if secs_left < 30 {
         debug!("Only {}s left, too late to enter", secs_left);
