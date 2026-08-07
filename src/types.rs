@@ -64,6 +64,63 @@ pub struct BtcPriceState {
     pub current_price: Option<f64>,
     pub window_open_price: Option<f64>,
     pub last_update_ms: u64,
+    /// Latest Chainlink 30s TWAP, held as the exact signed E18 fixed-point
+    /// integer string straight from `payload.full_accuracy_value`. This is a
+    /// settlement price, so it is never parsed through f64 — see
+    /// [`format_e18`] to render it for display.
+    ///
+    /// DATA COLLECTION ONLY: nothing in strategy/entry/resolution reads this.
+    pub twap_30_value: Option<String>,
+    /// Chainlink observation time for `twap_30_value` (`payload.timestamp`,
+    /// ms), not local receive time.
+    ///
+    /// NOTE: the "30 seconds" is a LOOKBACK WINDOW, not a publication cadence.
+    /// Judge freshness only from this timestamp — never from how often updates
+    /// arrive, since the feed's update rate says nothing about staleness.
+    pub twap_30_observed_at_ms: u64,
+    /// `payload.value`, the feed's display-only float. Diagnostics and logging
+    /// only — never persisted to a settlement column.
+    pub twap_30_display_value: Option<f64>,
+}
+
+/// Render an exact signed E18 fixed-point integer string (Chainlink
+/// `full_accuracy_value`) as a decimal string.
+///
+/// Uses string arithmetic only, so arbitrarily large values round-trip without
+/// the precision loss an f64 or a fixed-width integer would introduce. Returns
+/// `None` if `raw` is not a plain, optionally-signed integer.
+pub fn format_e18(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let trimmed = digits.trim_start_matches('0');
+    let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+
+    let (int_part, frac_raw) = if trimmed.len() > 18 {
+        trimmed.split_at(trimmed.len() - 18)
+    } else {
+        ("0", trimmed)
+    };
+    let frac_padded = format!("{:0>18}", frac_raw);
+    let frac = frac_padded.trim_end_matches('0');
+
+    let is_zero = int_part == "0" && frac.is_empty();
+    let mut out = String::new();
+    if neg && !is_zero {
+        out.push('-');
+    }
+    out.push_str(int_part);
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    Some(out)
 }
 
 // ── Binance BTC Price State ──
@@ -240,6 +297,12 @@ pub struct RtdsSubscription {
     pub topic: String,
     #[serde(rename = "type")]
     pub sub_type: String,
+    /// JSON-*encoded string* (not a nested object), in the exact compact form
+    /// the RTDS docs require: `{"symbol":"btc/usd"}` — lowercase, no spaces.
+    /// Skipped when absent so the existing spot subscription frame serializes
+    /// exactly as it did before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +316,99 @@ pub struct RtdsPayload {
     pub symbol: Option<String>,
     pub value: Option<f64>,
     pub timestamp: Option<u64>,
+    /// TWAP topics only: the exact signed E18 fixed-point value, as a string.
+    /// `value` above is documented as display-only for these topics.
+    pub full_accuracy_value: Option<String>,
+    /// TWAP topics only: the lookback window in seconds (30 or 60).
+    pub window_s: Option<u32>,
+}
+
+#[cfg(test)]
+mod rtds_tests {
+    use super::*;
+
+    /// The spot frame must serialize exactly as it did before `filters` was
+    /// added, i.e. with no `filters` key at all.
+    #[test]
+    fn spot_subscription_omits_filters() {
+        let sub = RtdsSubscribe {
+            action: "subscribe".into(),
+            subscriptions: vec![RtdsSubscription {
+                topic: "crypto_prices_chainlink".into(),
+                sub_type: "update".into(),
+                filters: None,
+            }],
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(!json.contains("filters"), "spot frame changed: {}", json);
+        assert_eq!(
+            json,
+            r#"{"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"update"}]}"#
+        );
+    }
+
+    /// RTDS requires `filters` to be a JSON-encoded *string*, not a nested
+    /// object, in compact lowercase form.
+    #[test]
+    fn twap_subscription_encodes_filters_as_string() {
+        let sub = RtdsSubscribe {
+            action: "subscribe".into(),
+            subscriptions: vec![RtdsSubscription {
+                topic: "crypto_prices_twap_thirty".into(),
+                sub_type: "update".into(),
+                filters: Some(r#"{"symbol":"btc/usd"}"#.into()),
+            }],
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert_eq!(
+            json,
+            r#"{"action":"subscribe","subscriptions":[{"topic":"crypto_prices_twap_thirty","type":"update","filters":"{\"symbol\":\"btc/usd\"}"}]}"#
+        );
+    }
+
+    /// The documented TWAP payload must parse, preserving the exact value as a
+    /// string and the Chainlink observation timestamp.
+    #[test]
+    fn parses_documented_twap_payload() {
+        let raw = r#"{"topic":"crypto_prices_twap_thirty","type":"update","timestamp":1785178800123,
+            "payload":{"symbol":"btc/usd","value":65000.5,
+            "full_accuracy_value":"65000500000000000000000",
+            "timestamp":1785178800000,"window_s":30}}"#;
+        let msg: RtdsMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.topic.as_deref(), Some("crypto_prices_twap_thirty"));
+        let p = msg.payload.unwrap();
+        assert_eq!(p.full_accuracy_value.as_deref(), Some("65000500000000000000000"));
+        assert_eq!(p.timestamp, Some(1785178800000));
+        assert_eq!(p.window_s, Some(30));
+        assert_eq!(format_e18(&p.full_accuracy_value.unwrap()).unwrap(), "65000.5");
+    }
+
+    /// The pre-existing spot payload must still parse unchanged.
+    #[test]
+    fn parses_spot_payload_unchanged() {
+        let raw = r#"{"topic":"crypto_prices_chainlink",
+            "payload":{"symbol":"btc/usd","value":65000.5,"timestamp":1785178800000}}"#;
+        let msg: RtdsMessage = serde_json::from_str(raw).unwrap();
+        let p = msg.payload.unwrap();
+        assert_eq!(p.value, Some(65000.5));
+        assert_eq!(p.full_accuracy_value, None);
+    }
+
+    #[test]
+    fn format_e18_preserves_full_precision() {
+        assert_eq!(format_e18("65000500000000000000000").unwrap(), "65000.5");
+        assert_eq!(
+            format_e18("65000123456789012345678").unwrap(),
+            "65000.123456789012345678"
+        );
+        assert_eq!(format_e18("500000000000000000").unwrap(), "0.5");
+        assert_eq!(format_e18("1").unwrap(), "0.000000000000000001");
+        assert_eq!(format_e18("0").unwrap(), "0");
+        assert_eq!(format_e18("-65000500000000000000000").unwrap(), "-65000.5");
+        assert_eq!(format_e18("12.5"), None);
+        assert_eq!(format_e18("abc"), None);
+        assert_eq!(format_e18(""), None);
+    }
 }
 
 // ── CLOB WebSocket Messages ──

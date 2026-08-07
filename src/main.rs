@@ -242,13 +242,28 @@ async fn main() {
             }
 
             // Record window open price (RTDS/Chainlink)
-            {
+            let (twap_open, twap_open_ms, snapshot_open) = {
                 let mut btc = btc_price.write().await;
                 btc.window_open_price = btc.current_price;
                 if let Some(p) = btc.window_open_price {
                     info!("Window open BTC price (RTDS): ${:.2}", p);
                 }
-            }
+                // DATA COLLECTION ONLY: capture the TWAP reading alongside the
+                // snapshot open. Not used by any entry/strategy decision.
+                (
+                    btc.twap_30_value.clone(),
+                    btc.twap_30_observed_at_ms,
+                    btc.window_open_price,
+                )
+            };
+            db.record_twap_at_open(
+                current_ts as i64,
+                twap_open.as_deref(),
+                // NULL when the feed has not produced a reading yet, rather
+                // than a fabricated zero.
+                (twap_open_ms != 0).then_some(twap_open_ms as i64),
+                snapshot_open,
+            );
 
             // Record window open price (Binance)
             {
@@ -503,7 +518,16 @@ async fn main() {
             };
 
             // Capture price source snapshot
-            let (bn_entry, bn_open, rtds_entry, rtds_open, rtds_stale, trend_val) = {
+            let (
+                bn_entry,
+                bn_open,
+                rtds_entry,
+                rtds_open,
+                rtds_stale,
+                trend_val,
+                twap_entry,
+                twap_entry_ms,
+            ) = {
                 let bn = binance_price.read().await;
                 let btc = btc_price.read().await;
                 let now_ms = chrono::Utc::now().timestamp_millis() as u64;
@@ -516,6 +540,10 @@ async fn main() {
                     btc.window_open_price,
                     stale,
                     bn.trend_strength(),
+                    // DATA COLLECTION ONLY: recorded after the order is placed,
+                    // never consulted when deciding to place it.
+                    btc.twap_30_value.clone(),
+                    btc.twap_30_observed_at_ms,
                 )
             };
 
@@ -661,6 +689,15 @@ async fn main() {
                 error!("Failed to insert trade: {}", e);
             }
 
+            // DATA COLLECTION ONLY: TWAP reading captured when the order was
+            // placed. NULL if the feed had not produced a reading yet.
+            db.record_twap_at_entry(
+                current_ts as i64,
+                twap_entry.as_deref(),
+                (twap_entry_ms != 0).then_some(twap_entry_ms as i64),
+                &signal.side,
+            );
+
             db.insert_signal(&eval_result, current_ts as i64, secs_left, dry_run);
 
             // Mark entered, clear any pending retry intent
@@ -711,6 +748,61 @@ async fn main() {
 
             // Find the trade for this specific window
             let trade = db.get_trade_by_window_ts(window_ts);
+
+            // ── DATA COLLECTION ONLY: TWAP vs snapshot comparison ──
+            // Recorded before the trade branch below so windows the bot passed
+            // on are captured too. Reads no trading state and changes no
+            // control flow; the resolution handling below is untouched.
+            let already_resolved = trade
+                .as_ref()
+                .map(|t| t.resolution.is_some())
+                .unwrap_or(false);
+
+            if !already_resolved {
+                let (twap_resolve, twap_resolve_ms, snapshot_resolve) = {
+                    let btc = btc_price.read().await;
+                    (
+                        btc.twap_30_value.clone(),
+                        btc.twap_30_observed_at_ms,
+                        btc.current_price,
+                    )
+                };
+
+                db.record_twap_at_resolve(
+                    window_ts,
+                    twap_resolve.as_deref(),
+                    (twap_resolve_ms != 0).then_some(twap_resolve_ms as i64),
+                    snapshot_resolve,
+                    &event.winning_outcome,
+                );
+
+                let snapshot_close = snapshot_resolve
+                    .map(|p| format!("{:.2}", p))
+                    .unwrap_or_else(|| "N/A".into());
+                let twap_close = twap_resolve
+                    .as_deref()
+                    .and_then(format_e18)
+                    .unwrap_or_else(|| "N/A".into());
+                let predicted_side = trade
+                    .as_ref()
+                    .map(|t| t.side.clone())
+                    .unwrap_or_else(|| "N/A".into());
+                let matched = trade
+                    .as_ref()
+                    .map(|t| (t.side == event.winning_outcome).to_string())
+                    .unwrap_or_else(|| "N/A".into());
+
+                info!(
+                    "TWAP compare: window={} snapshot_close={} twap_close={} \
+                     my_predicted={} actual_resolution={} match={}",
+                    window_ts,
+                    snapshot_close,
+                    twap_close,
+                    predicted_side,
+                    event.winning_outcome,
+                    matched
+                );
+            }
 
             if let Some(trade) = trade {
                 if trade.resolution.is_some() {

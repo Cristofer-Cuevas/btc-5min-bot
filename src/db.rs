@@ -22,6 +22,30 @@ const TRADE_SELECT_COLS: &str = "\
     signal_detected_ms, order_sent_ms, order_ack_ms, \
     bot_version, neg_risk";
 
+/// True if `table` already has a column named `column`, per pragma table_info.
+/// Used to guard additive migrations so re-running init is a no-op instead of
+/// an error. Returns true on query failure so a broken pragma never causes a
+/// blind ALTER.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = match conn.prepare(&format!("PRAGMA table_info({})", table)) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("pragma table_info({}) failed: {}", table, e);
+            return true;
+        }
+    };
+    let found = stmt.query_map([], |row| row.get::<_, String>(1)).map(|rows| {
+        rows.filter_map(|r| r.ok()).any(|name| name == column)
+    });
+    match found {
+        Ok(v) => v,
+        Err(e) => {
+            error!("pragma table_info({}) read failed: {}", table, e);
+            true
+        }
+    }
+}
+
 fn read_trade_row(row: &Row) -> rusqlite::Result<TradeRecord> {
     let won_int: Option<i32> = row.get(10)?;
     let dry_run_int: i32 = row.get(15)?;
@@ -155,6 +179,35 @@ impl Database {
                 resumed_at          INTEGER
             );
 
+            -- DATA COLLECTION ONLY (Chainlink 30s TWAP settlement study).
+            -- Nothing in the trading path reads this table.
+            --
+            -- Kept separate from `trades` deliberately:
+            --   * `trades` only has rows for windows the bot actually entered,
+            --     so per-window TWAP-vs-snapshot comparison would be lost for
+            --     every window the bot passed on.
+            --   * `trades` is read positionally (TRADE_SELECT_COLS +
+            --     read_trade_row), so widening it would touch the read path
+            --     that resolution depends on.
+            --
+            -- TWAP values are stored as TEXT holding the exact signed E18
+            -- fixed-point integer from `payload.full_accuracy_value`. Divide by
+            -- 10^18 with integer/decimal arithmetic — never through a float.
+            CREATE TABLE IF NOT EXISTS twap_observations (
+                window_ts                   INTEGER PRIMARY KEY,
+                twap_30_at_open             TEXT,
+                twap_30_at_open_ms          INTEGER,
+                twap_30_at_entry            TEXT,
+                twap_30_at_entry_ms         INTEGER,
+                twap_30_at_resolve          TEXT,
+                twap_30_at_resolve_ms       INTEGER,
+                snapshot_price_at_open      REAL,
+                snapshot_price_at_resolve   REAL,
+                predicted_side              TEXT,
+                actual_resolution           TEXT,
+                updated_at                  INTEGER
+            );
+
             CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_signals_window ON signals(window_ts);
@@ -193,8 +246,126 @@ impl Database {
             let _ = conn.execute(sql, []);
         }
 
+        // TWAP observation columns, added with an explicit pragma guard so a
+        // pre-existing twap_observations table (from an earlier build) is
+        // widened in place rather than dropped/recreated. Additive and
+        // NULL-defaulted; no existing data is touched.
+        let twap_cols: [(&str, &str); 11] = [
+            ("twap_30_at_open", "TEXT"),
+            ("twap_30_at_open_ms", "INTEGER"),
+            ("twap_30_at_entry", "TEXT"),
+            ("twap_30_at_entry_ms", "INTEGER"),
+            ("twap_30_at_resolve", "TEXT"),
+            ("twap_30_at_resolve_ms", "INTEGER"),
+            ("snapshot_price_at_open", "REAL"),
+            ("snapshot_price_at_resolve", "REAL"),
+            ("predicted_side", "TEXT"),
+            ("actual_resolution", "TEXT"),
+            ("updated_at", "INTEGER"),
+        ];
+        for (name, ty) in &twap_cols {
+            if !column_exists(&conn, "twap_observations", name) {
+                let sql = format!(
+                    "ALTER TABLE twap_observations ADD COLUMN {} {}",
+                    name, ty
+                );
+                if let Err(e) = conn.execute(&sql, []) {
+                    error!("Failed to add twap_observations column {}: {}", name, e);
+                }
+            }
+        }
+
         info!("Database tables initialized");
         Ok(())
+    }
+
+    /// Record the TWAP/snapshot reading at window open. Upsert keyed by
+    /// window_ts. `twap` is the exact E18 string, or None when the feed has not
+    /// warmed up — stored as NULL rather than interpolated.
+    pub fn record_twap_at_open(
+        &self,
+        window_ts: i64,
+        twap: Option<&str>,
+        twap_observed_ms: Option<i64>,
+        snapshot_price: Option<f64>,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = conn.execute(
+            "INSERT INTO twap_observations (
+                window_ts, twap_30_at_open, twap_30_at_open_ms,
+                snapshot_price_at_open, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(window_ts) DO UPDATE SET
+                twap_30_at_open = excluded.twap_30_at_open,
+                twap_30_at_open_ms = excluded.twap_30_at_open_ms,
+                snapshot_price_at_open = excluded.snapshot_price_at_open,
+                updated_at = excluded.updated_at",
+            params![window_ts, twap, twap_observed_ms, snapshot_price, now],
+        ) {
+            error!("Failed to record TWAP at open: {}", e);
+        }
+    }
+
+    /// Record the TWAP reading at the moment an order was placed.
+    pub fn record_twap_at_entry(
+        &self,
+        window_ts: i64,
+        twap: Option<&str>,
+        twap_observed_ms: Option<i64>,
+        predicted_side: &str,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = conn.execute(
+            "INSERT INTO twap_observations (
+                window_ts, twap_30_at_entry, twap_30_at_entry_ms,
+                predicted_side, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(window_ts) DO UPDATE SET
+                twap_30_at_entry = excluded.twap_30_at_entry,
+                twap_30_at_entry_ms = excluded.twap_30_at_entry_ms,
+                predicted_side = excluded.predicted_side,
+                updated_at = excluded.updated_at",
+            params![window_ts, twap, twap_observed_ms, predicted_side, now],
+        ) {
+            error!("Failed to record TWAP at entry: {}", e);
+        }
+    }
+
+    /// Record the TWAP/snapshot reading near window close/settlement.
+    pub fn record_twap_at_resolve(
+        &self,
+        window_ts: i64,
+        twap: Option<&str>,
+        twap_observed_ms: Option<i64>,
+        snapshot_price: Option<f64>,
+        actual_resolution: &str,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = conn.execute(
+            "INSERT INTO twap_observations (
+                window_ts, twap_30_at_resolve, twap_30_at_resolve_ms,
+                snapshot_price_at_resolve, actual_resolution, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(window_ts) DO UPDATE SET
+                twap_30_at_resolve = excluded.twap_30_at_resolve,
+                twap_30_at_resolve_ms = excluded.twap_30_at_resolve_ms,
+                snapshot_price_at_resolve = excluded.snapshot_price_at_resolve,
+                actual_resolution = excluded.actual_resolution,
+                updated_at = excluded.updated_at",
+            params![
+                window_ts,
+                twap,
+                twap_observed_ms,
+                snapshot_price,
+                actual_resolution,
+                now
+            ],
+        ) {
+            error!("Failed to record TWAP at resolve: {}", e);
+        }
     }
 
     pub fn insert_trade(&self, trade: &TradeRecord) -> SqlResult<i64> {
