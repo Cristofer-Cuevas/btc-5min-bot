@@ -35,6 +35,39 @@ use crate::types::*;
 
 const BOT_VERSION: &str = env!("BOT_GIT_HASH");
 
+/// DATA COLLECTION ONLY. Returns the current TWAP reading only if it is fresh,
+/// otherwise `None` so the caller writes NULL.
+///
+/// The RTDS TWAP feed goes silent for long stretches with no backfill, so the
+/// last-known value can be hours old; writing it would record a stale price as
+/// if it were the window's. Each capture point calls this at most once per
+/// window, so the warning is inherently rate-limited to once per window per
+/// capture point.
+async fn fresh_twap_for_capture(
+    btc_price: &SharedBtcPrice,
+    now_ms: i64,
+    capture_point: &str,
+) -> Option<(String, i64)> {
+    let btc = btc_price.read().await;
+    if let Some(fresh) = btc.fresh_twap_30(now_ms, TWAP_MAX_AGE_MS) {
+        return Some(fresh);
+    }
+    match btc.twap_30_observed_at_ms {
+        Some(obs) => {
+            let age_secs = now_ms.saturating_sub(obs) / 1000;
+            warn!(
+                "TWAP stale at {}: last observed {}s ago, storing NULL",
+                capture_point, age_secs
+            );
+        }
+        None => warn!(
+            "TWAP stale at {}: no reading received yet, storing NULL",
+            capture_point
+        ),
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() {
     // ── 1. Load config ──
@@ -212,6 +245,51 @@ async fn main() {
 
         let current_ts = discovery::current_window_ts();
         let secs_left = discovery::secs_remaining();
+        let now_secs = chrono::Utc::now().timestamp();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // ── DATA COLLECTION ONLY: close capture at the WINDOW BOUNDARY ──
+        // Fires on the first tick at/after window_ts + WINDOW_SECS, i.e. the
+        // moment the outgoing window ends. Deliberately NOT driven by the
+        // market_resolved event, which arrives minutes late and with variable
+        // delay. Runs before the rotation block below so `last_window_ts` still
+        // names the window that just closed — the row written is the outgoing
+        // window's, not the new one's.
+        //
+        // Changes no trading state and no control flow.
+        if last_window_ts != 0 && now_secs >= last_window_ts as i64 + WINDOW_SECS {
+            let needs_capture = !window_state.read().await.resolve_captured;
+            if needs_capture {
+                let closing_ts = last_window_ts as i64;
+                let fresh = fresh_twap_for_capture(&btc_price, now_ms, "resolve").await;
+                let snapshot_close = btc_price.read().await.current_price;
+
+                db.record_twap_at_resolve(
+                    closing_ts,
+                    fresh.as_ref().map(|(v, _)| v.as_str()),
+                    fresh.as_ref().map(|(_, obs)| *obs),
+                    snapshot_close,
+                    now_ms,
+                );
+
+                window_state.write().await.resolve_captured = true;
+
+                info!(
+                    "Boundary close capture: window={} captured_at_ms={} \
+                     (boundary={}) snapshot_close={} twap_close={}",
+                    closing_ts,
+                    now_ms,
+                    (closing_ts + WINDOW_SECS) * 1000,
+                    snapshot_close
+                        .map(|p| format!("{:.2}", p))
+                        .unwrap_or_else(|| "N/A".into()),
+                    fresh
+                        .as_ref()
+                        .and_then(|(v, _)| format_e18(v))
+                        .unwrap_or_else(|| "N/A".into()),
+                );
+            }
+        }
 
         // ── Window rotation ──
         if current_ts != last_window_ts {
@@ -233,6 +311,9 @@ async fn main() {
                 ws.next_window_prefetched = false;
                 ws.pending_retry_signal = None;
                 ws.last_attempt_failed_at_ms = None;
+                // DATA COLLECTION ONLY: arm both captures for the new window.
+                ws.open_captured = false;
+                ws.resolve_captured = false;
             }
 
             // Reset market state
@@ -242,28 +323,13 @@ async fn main() {
             }
 
             // Record window open price (RTDS/Chainlink)
-            let (twap_open, twap_open_ms, snapshot_open) = {
+            {
                 let mut btc = btc_price.write().await;
                 btc.window_open_price = btc.current_price;
                 if let Some(p) = btc.window_open_price {
                     info!("Window open BTC price (RTDS): ${:.2}", p);
                 }
-                // DATA COLLECTION ONLY: capture the TWAP reading alongside the
-                // snapshot open. Not used by any entry/strategy decision.
-                (
-                    btc.twap_30_value.clone(),
-                    btc.twap_30_observed_at_ms,
-                    btc.window_open_price,
-                )
-            };
-            db.record_twap_at_open(
-                current_ts as i64,
-                twap_open.as_deref(),
-                // NULL when the feed has not produced a reading yet, rather
-                // than a fabricated zero.
-                (twap_open_ms != 0).then_some(twap_open_ms as i64),
-                snapshot_open,
-            );
+            }
 
             // Record window open price (Binance)
             {
@@ -286,6 +352,16 @@ async fn main() {
                         })
                         .await;
 
+                    // DATA COLLECTION ONLY: remember which tokens this bot
+                    // believes belong to this window, so a resolution event
+                    // naming a different asset can be identified as a mapping
+                    // bug rather than a capture-timing problem.
+                    db.record_expected_tokens(
+                        current_ts as i64,
+                        &market.up_token_id,
+                        &market.down_token_id,
+                    );
+
                     // Populate token_id → window_ts map for resolution matching
                     {
                         let mut twm = token_window_map.write().await;
@@ -304,6 +380,46 @@ async fn main() {
             }
 
             last_window_ts = current_ts;
+        }
+
+        // ── DATA COLLECTION ONLY: open capture, at or after window_ts ──
+        // Never before the strike: a reading taken even a moment early belongs
+        // to the previous window. Rotation is driven by a floored clock so it
+        // cannot fire early in practice, but if a tick ever arrives before the
+        // boundary the capture defers to the next one that qualifies. The
+        // `open_captured` flag makes it exactly once per window.
+        //
+        // Reads `current_price` (the live tick at the boundary) rather than
+        // `window_open_price`, which the trading path sets on rotation and is
+        // left completely untouched here.
+        if !window_state.read().await.open_captured && now_secs >= current_ts as i64 {
+            let fresh = fresh_twap_for_capture(&btc_price, now_ms, "open").await;
+            let snapshot_open = btc_price.read().await.current_price;
+
+            db.record_twap_at_open(
+                current_ts as i64,
+                fresh.as_ref().map(|(v, _)| v.as_str()),
+                fresh.as_ref().map(|(_, obs)| *obs),
+                snapshot_open,
+                now_ms,
+            );
+
+            window_state.write().await.open_captured = true;
+
+            info!(
+                "Boundary open capture: window={} captured_at_ms={} \
+                 (boundary={}) snapshot_open={} twap_open={}",
+                current_ts,
+                now_ms,
+                current_ts as i64 * 1000,
+                snapshot_open
+                    .map(|p| format!("{:.2}", p))
+                    .unwrap_or_else(|| "N/A".into()),
+                fresh
+                    .as_ref()
+                    .and_then(|(v, _)| format_e18(v))
+                    .unwrap_or_else(|| "N/A".into()),
+            );
         }
 
         // ── Pre-fetch next window (once, 10-15s before end) ──
@@ -518,16 +634,7 @@ async fn main() {
             };
 
             // Capture price source snapshot
-            let (
-                bn_entry,
-                bn_open,
-                rtds_entry,
-                rtds_open,
-                rtds_stale,
-                trend_val,
-                twap_entry,
-                twap_entry_ms,
-            ) = {
+            let (bn_entry, bn_open, rtds_entry, rtds_open, rtds_stale, trend_val) = {
                 let bn = binance_price.read().await;
                 let btc = btc_price.read().await;
                 let now_ms = chrono::Utc::now().timestamp_millis() as u64;
@@ -540,12 +647,17 @@ async fn main() {
                     btc.window_open_price,
                     stale,
                     bn.trend_strength(),
-                    // DATA COLLECTION ONLY: recorded after the order is placed,
-                    // never consulted when deciding to place it.
-                    btc.twap_30_value.clone(),
-                    btc.twap_30_observed_at_ms,
                 )
             };
+
+            // DATA COLLECTION ONLY: recorded after the order is placed, never
+            // consulted when deciding to place it. Stale readings become NULL.
+            let twap_entry = fresh_twap_for_capture(
+                &btc_price,
+                chrono::Utc::now().timestamp_millis(),
+                "entry",
+            )
+            .await;
 
             let limit_price = {
                 let raw = signal.ask_price + cfg.max_slippage;
@@ -693,8 +805,8 @@ async fn main() {
             // placed. NULL if the feed had not produced a reading yet.
             db.record_twap_at_entry(
                 current_ts as i64,
-                twap_entry.as_deref(),
-                (twap_entry_ms != 0).then_some(twap_entry_ms as i64),
+                twap_entry.as_ref().map(|(v, _)| v.as_str()),
+                twap_entry.as_ref().map(|(_, obs)| *obs),
                 &signal.side,
             );
 
@@ -759,22 +871,36 @@ async fn main() {
                 .unwrap_or(false);
 
             if !already_resolved {
-                let (twap_resolve, twap_resolve_ms, snapshot_resolve) = {
-                    let btc = btc_price.read().await;
-                    (
-                        btc.twap_30_value.clone(),
-                        btc.twap_30_observed_at_ms,
-                        btc.current_price,
-                    )
-                };
+                // The close values were captured at the window boundary, not
+                // here — the resolution event arrives late and with variable
+                // delay. Read them back rather than re-sampling live state.
+                let (twap_resolve, snapshot_resolve) = db.get_twap_closes(window_ts);
 
-                db.record_twap_at_resolve(
+                db.record_resolution_diagnostics(
                     window_ts,
-                    twap_resolve.as_deref(),
-                    (twap_resolve_ms != 0).then_some(twap_resolve_ms as i64),
-                    snapshot_resolve,
                     &event.winning_outcome,
+                    &event.winning_asset_id,
+                    chrono::Utc::now().timestamp_millis(),
                 );
+
+                // If the resolved asset is neither token this bot recorded for
+                // the window, the token→window mapping attributed it wrongly —
+                // a different failure from a mistimed capture, and one that
+                // would otherwise masquerade as a bad prediction.
+                let (up_token, down_token) = db.get_expected_tokens(window_ts);
+                let matches_known = [up_token.as_deref(), down_token.as_deref()]
+                    .iter()
+                    .flatten()
+                    .any(|t| *t == event.winning_asset_id);
+                if !matches_known {
+                    error!(
+                        "Resolution asset {} matches neither token for window {} (up={}, down={})",
+                        event.winning_asset_id,
+                        window_ts,
+                        up_token.as_deref().unwrap_or("N/A"),
+                        down_token.as_deref().unwrap_or("N/A"),
+                    );
+                }
 
                 let snapshot_close = snapshot_resolve
                     .map(|p| format!("{:.2}", p))

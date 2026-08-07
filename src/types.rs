@@ -72,15 +72,35 @@ pub struct BtcPriceState {
     /// DATA COLLECTION ONLY: nothing in strategy/entry/resolution reads this.
     pub twap_30_value: Option<String>,
     /// Chainlink observation time for `twap_30_value` (`payload.timestamp`,
-    /// ms), not local receive time.
+    /// ms), not local receive time. `None` until the feed delivers a reading
+    /// carrying a timestamp — freshness cannot be judged without one.
     ///
     /// NOTE: the "30 seconds" is a LOOKBACK WINDOW, not a publication cadence.
     /// Judge freshness only from this timestamp — never from how often updates
     /// arrive, since the feed's update rate says nothing about staleness.
-    pub twap_30_observed_at_ms: u64,
+    pub twap_30_observed_at_ms: Option<i64>,
     /// `payload.value`, the feed's display-only float. Diagnostics and logging
     /// only — never persisted to a settlement column.
     pub twap_30_display_value: Option<f64>,
+}
+
+impl BtcPriceState {
+    /// Returns (value, observed_at_ms) only if the reading is fresh.
+    ///
+    /// The RTDS TWAP feed can go silent for long stretches with no backfill
+    /// (docs: "no snapshot, history, or replay after a disconnect"), so a
+    /// last-known value can be hours old. 30s is a LOOKBACK WINDOW, not a
+    /// publication rate — freshness must come from observed_at_ms.
+    ///
+    /// DATA COLLECTION ONLY: no trading path calls this.
+    pub fn fresh_twap_30(&self, now_ms: i64, max_age_ms: i64) -> Option<(String, i64)> {
+        let v = self.twap_30_value.as_ref()?;
+        let obs = self.twap_30_observed_at_ms?;
+        if now_ms.saturating_sub(obs) > max_age_ms {
+            return None;
+        }
+        Some((v.clone(), obs))
+    }
 }
 
 /// Render an exact signed E18 fixed-point integer string (Chainlink
@@ -189,6 +209,13 @@ pub struct WindowState {
     pub next_window_prefetched: bool,
     pub pending_retry_signal: Option<EntrySignal>,
     pub last_attempt_failed_at_ms: Option<i64>,
+    /// DATA COLLECTION ONLY. Set once the window's open TWAP/snapshot capture
+    /// has run (at or after `window_ts`); cleared on rotation so each window
+    /// captures exactly once. Read by no trading path.
+    pub open_captured: bool,
+    /// DATA COLLECTION ONLY. Set once the outgoing window's boundary capture
+    /// has run (at or after `window_ts + WINDOW_SECS`); cleared on rotation.
+    pub resolve_captured: bool,
 }
 
 // ── Trade Record (for DB) ──
@@ -392,6 +419,48 @@ mod rtds_tests {
         let p = msg.payload.unwrap();
         assert_eq!(p.value, Some(65000.5));
         assert_eq!(p.full_accuracy_value, None);
+    }
+
+    fn state_with(value: Option<&str>, obs: Option<i64>) -> BtcPriceState {
+        BtcPriceState {
+            twap_30_value: value.map(|v| v.to_string()),
+            twap_30_observed_at_ms: obs,
+            ..Default::default()
+        }
+    }
+
+    const NOW: i64 = 1_785_178_800_000;
+    const MAX_AGE: i64 = 60_000;
+
+    #[test]
+    fn fresh_twap_returns_value_within_max_age() {
+        let s = state_with(Some("65000500000000000000000"), Some(NOW - 59_000));
+        let (v, obs) = s.fresh_twap_30(NOW, MAX_AGE).unwrap();
+        assert_eq!(v, "65000500000000000000000");
+        assert_eq!(obs, NOW - 59_000);
+    }
+
+    #[test]
+    fn fresh_twap_rejects_stale_reading() {
+        // The real bug: one reading replayed across ~110 minutes of windows.
+        let s = state_with(Some("65000500000000000000000"), Some(NOW - 110 * 60_000));
+        assert_eq!(s.fresh_twap_30(NOW, MAX_AGE), None);
+    }
+
+    #[test]
+    fn fresh_twap_boundary_is_inclusive_at_max_age() {
+        let s = state_with(Some("1"), Some(NOW - MAX_AGE));
+        assert!(s.fresh_twap_30(NOW, MAX_AGE).is_some(), "exactly max_age is fresh");
+        let s = state_with(Some("1"), Some(NOW - MAX_AGE - 1));
+        assert!(s.fresh_twap_30(NOW, MAX_AGE).is_none(), "one ms past is stale");
+    }
+
+    #[test]
+    fn fresh_twap_none_without_value_or_timestamp() {
+        assert_eq!(state_with(None, Some(NOW)).fresh_twap_30(NOW, MAX_AGE), None);
+        // No observation time means freshness cannot be judged: fail closed.
+        assert_eq!(state_with(Some("1"), None).fresh_twap_30(NOW, MAX_AGE), None);
+        assert_eq!(BtcPriceState::default().fresh_twap_30(NOW, MAX_AGE), None);
     }
 
     #[test]

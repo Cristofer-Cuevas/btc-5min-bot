@@ -205,8 +205,13 @@ async fn handle_twap_update(msg: &RtdsMessage, btc_price: &SharedBtcPrice, twap_
     };
 
     // Use the Chainlink observation time, not local receive time and not the
-    // outer publisher timestamp.
-    let observed_ms = payload.timestamp.unwrap_or(0);
+    // outer publisher timestamp. Left as None if the feed omits it: freshness
+    // is judged solely from this value, so an absent timestamp must fail
+    // closed (treated as stale) rather than default to a misleading zero.
+    let observed_ms = payload.timestamp.map(|t| t as i64);
+    if observed_ms.is_none() {
+        warn!("TWAP update missing payload.timestamp; reading cannot be freshness-checked");
+    }
 
     {
         let mut state = btc_price.write().await;
@@ -218,7 +223,7 @@ async fn handle_twap_update(msg: &RtdsMessage, btc_price: &SharedBtcPrice, twap_
     if !*twap_seen {
         *twap_seen = true;
         info!(
-            "TWAP feed live: {} btc/usd = {} (window_s={:?}, observed_at_ms={})",
+            "TWAP feed live: {} btc/usd = {} (window_s={:?}, observed_at_ms={:?})",
             TWAP_TOPIC,
             format_e18(exact).unwrap_or_else(|| exact.to_string()),
             payload.window_s,
@@ -227,7 +232,7 @@ async fn handle_twap_update(msg: &RtdsMessage, btc_price: &SharedBtcPrice, twap_
     }
 
     debug!(
-        "TWAP30 btc/usd: {} (raw_e18={}, observed_at_ms={})",
+        "TWAP30 btc/usd: {} (raw_e18={}, observed_at_ms={:?})",
         format_e18(exact).unwrap_or_else(|| exact.to_string()),
         exact,
         observed_ms

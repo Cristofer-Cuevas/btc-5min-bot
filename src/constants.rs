@@ -16,3 +16,9 @@ pub const TOKEN_WINDOW_RETENTION_SECS: u64 = 1800;
 
 /// Main loop tick interval (milliseconds).
 pub const BOT_TICK_MS: u64 = 250;
+
+/// Max age for a TWAP reading to count as fresh (ms).
+pub const TWAP_MAX_AGE_MS: i64 = 60_000;
+
+/// Length of a trading window in seconds.
+pub const WINDOW_SECS: i64 = 300;

@@ -205,7 +205,19 @@ impl Database {
                 snapshot_price_at_resolve   REAL,
                 predicted_side              TEXT,
                 actual_resolution           TEXT,
-                updated_at                  INTEGER
+                updated_at                  INTEGER,
+                -- Bot wall-clock at each capture, so capture timing can be
+                -- verified against the window boundaries. Distinct from the
+                -- *_ms columns above, which hold the FEED's Chainlink
+                -- observation time (what freshness is judged on).
+                open_captured_at_ms         INTEGER,
+                resolve_captured_at_ms      INTEGER,
+                -- Resolution-mapping diagnostics: lets a bad token->window
+                -- attribution be told apart from a capture-timing problem.
+                resolution_asset_id         TEXT,
+                resolution_event_ms         INTEGER,
+                expected_up_token           TEXT,
+                expected_down_token         TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
@@ -250,7 +262,7 @@ impl Database {
         // pre-existing twap_observations table (from an earlier build) is
         // widened in place rather than dropped/recreated. Additive and
         // NULL-defaulted; no existing data is touched.
-        let twap_cols: [(&str, &str); 11] = [
+        let twap_cols: [(&str, &str); 17] = [
             ("twap_30_at_open", "TEXT"),
             ("twap_30_at_open_ms", "INTEGER"),
             ("twap_30_at_entry", "TEXT"),
@@ -262,6 +274,12 @@ impl Database {
             ("predicted_side", "TEXT"),
             ("actual_resolution", "TEXT"),
             ("updated_at", "INTEGER"),
+            ("open_captured_at_ms", "INTEGER"),
+            ("resolve_captured_at_ms", "INTEGER"),
+            ("resolution_asset_id", "TEXT"),
+            ("resolution_event_ms", "INTEGER"),
+            ("expected_up_token", "TEXT"),
+            ("expected_down_token", "TEXT"),
         ];
         for (name, ty) in &twap_cols {
             if !column_exists(&conn, "twap_observations", name) {
@@ -280,30 +298,121 @@ impl Database {
     }
 
     /// Record the TWAP/snapshot reading at window open. Upsert keyed by
-    /// window_ts. `twap` is the exact E18 string, or None when the feed has not
-    /// warmed up — stored as NULL rather than interpolated.
+    /// window_ts. `twap` is the exact E18 string, or None when the reading is
+    /// stale or absent — stored as NULL rather than interpolated.
+    ///
+    /// `twap_observed_ms` is the FEED's Chainlink observation time;
+    /// `captured_at_ms` is the bot's wall-clock at capture. They answer
+    /// different questions and are stored separately.
     pub fn record_twap_at_open(
         &self,
         window_ts: i64,
         twap: Option<&str>,
         twap_observed_ms: Option<i64>,
         snapshot_price: Option<f64>,
+        captured_at_ms: i64,
     ) {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = conn.execute(
             "INSERT INTO twap_observations (
                 window_ts, twap_30_at_open, twap_30_at_open_ms,
-                snapshot_price_at_open, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+                snapshot_price_at_open, open_captured_at_ms, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(window_ts) DO UPDATE SET
                 twap_30_at_open = excluded.twap_30_at_open,
                 twap_30_at_open_ms = excluded.twap_30_at_open_ms,
                 snapshot_price_at_open = excluded.snapshot_price_at_open,
+                open_captured_at_ms = excluded.open_captured_at_ms,
                 updated_at = excluded.updated_at",
-            params![window_ts, twap, twap_observed_ms, snapshot_price, now],
+            params![
+                window_ts,
+                twap,
+                twap_observed_ms,
+                snapshot_price,
+                captured_at_ms,
+                now
+            ],
         ) {
             error!("Failed to record TWAP at open: {}", e);
+        }
+    }
+
+    /// Record the up/down token ids the bot holds for a window, at discovery
+    /// time. Used later to detect a resolution attributed to the wrong window.
+    pub fn record_expected_tokens(&self, window_ts: i64, up_token: &str, down_token: &str) {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = conn.execute(
+            "INSERT INTO twap_observations (
+                window_ts, expected_up_token, expected_down_token, updated_at
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(window_ts) DO UPDATE SET
+                expected_up_token = excluded.expected_up_token,
+                expected_down_token = excluded.expected_down_token,
+                updated_at = excluded.updated_at",
+            params![window_ts, up_token, down_token, now],
+        ) {
+            error!("Failed to record expected tokens: {}", e);
+        }
+    }
+
+    /// The up/down token ids recorded for a window, if any.
+    pub fn get_expected_tokens(&self, window_ts: i64) -> (Option<String>, Option<String>) {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT expected_up_token, expected_down_token
+             FROM twap_observations WHERE window_ts = ?1",
+            params![window_ts],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((None, None))
+    }
+
+    /// The boundary-captured close values for a window, for the comparison log.
+    /// Returns (twap_30_at_resolve, snapshot_price_at_resolve).
+    pub fn get_twap_closes(&self, window_ts: i64) -> (Option<String>, Option<f64>) {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT twap_30_at_resolve, snapshot_price_at_resolve
+             FROM twap_observations WHERE window_ts = ?1",
+            params![window_ts],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((None, None))
+    }
+
+    /// Record the resolution event's own metadata, written when the
+    /// market_resolved event arrives (which is later and more variable than the
+    /// window boundary — hence kept separate from the close capture).
+    pub fn record_resolution_diagnostics(
+        &self,
+        window_ts: i64,
+        actual_resolution: &str,
+        resolution_asset_id: &str,
+        resolution_event_ms: i64,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = conn.execute(
+            "INSERT INTO twap_observations (
+                window_ts, actual_resolution, resolution_asset_id,
+                resolution_event_ms, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(window_ts) DO UPDATE SET
+                actual_resolution = excluded.actual_resolution,
+                resolution_asset_id = excluded.resolution_asset_id,
+                resolution_event_ms = excluded.resolution_event_ms,
+                updated_at = excluded.updated_at",
+            params![
+                window_ts,
+                actual_resolution,
+                resolution_asset_id,
+                resolution_event_ms,
+                now
+            ],
+        ) {
+            error!("Failed to record resolution diagnostics: {}", e);
         }
     }
 
@@ -333,34 +442,36 @@ impl Database {
         }
     }
 
-    /// Record the TWAP/snapshot reading near window close/settlement.
+    /// Record the TWAP/snapshot close, captured at the WINDOW BOUNDARY
+    /// (window_ts + WINDOW_SECS) rather than on the market_resolved event,
+    /// which arrives late and with variable delay.
     pub fn record_twap_at_resolve(
         &self,
         window_ts: i64,
         twap: Option<&str>,
         twap_observed_ms: Option<i64>,
         snapshot_price: Option<f64>,
-        actual_resolution: &str,
+        captured_at_ms: i64,
     ) {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = conn.execute(
             "INSERT INTO twap_observations (
                 window_ts, twap_30_at_resolve, twap_30_at_resolve_ms,
-                snapshot_price_at_resolve, actual_resolution, updated_at
+                snapshot_price_at_resolve, resolve_captured_at_ms, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(window_ts) DO UPDATE SET
                 twap_30_at_resolve = excluded.twap_30_at_resolve,
                 twap_30_at_resolve_ms = excluded.twap_30_at_resolve_ms,
                 snapshot_price_at_resolve = excluded.snapshot_price_at_resolve,
-                actual_resolution = excluded.actual_resolution,
+                resolve_captured_at_ms = excluded.resolve_captured_at_ms,
                 updated_at = excluded.updated_at",
             params![
                 window_ts,
                 twap,
                 twap_observed_ms,
                 snapshot_price,
-                actual_resolution,
+                captured_at_ms,
                 now
             ],
         ) {
