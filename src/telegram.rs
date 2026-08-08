@@ -256,11 +256,21 @@ async fn build_status(
 
     let secs_left = crate::discovery::secs_remaining();
 
+    // Health of the TWAP feed dependency over recent windows.
+    let (twap_fresh, twap_samples) = ws.twap_coverage();
+    let coverage_str = if twap_samples == 0 {
+        "no samples yet".to_string()
+    } else {
+        format!("{}/{}", twap_fresh, twap_samples)
+    };
+
     format!(
         "<b>Status</b>\n\
          Window: {} ({}s left)\n\
          BTC: {} (Δ: {})\n\
          Position: {}\n\
+         TWAP coverage: {}\n\
+         TWAP strike: {}\n\
          Dry run: {}\n\
          Paused: {}\n\
          Uptime: {}h {}m",
@@ -269,6 +279,11 @@ async fn build_status(
         btc_str,
         delta_str,
         if ws.entered { "IN" } else { "WAITING" },
+        coverage_str,
+        ws.twap_strike
+            .as_deref()
+            .and_then(crate::types::format_e18)
+            .unwrap_or_else(|| "N/A".into()),
         cfg.dry_run,
         ws.paused,
         hours,

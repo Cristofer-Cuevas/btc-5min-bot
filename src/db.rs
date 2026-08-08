@@ -20,7 +20,8 @@ const TRADE_SELECT_COLS: &str = "\
     trend_strength, \
     limit_price, fill_price, fill_attempts, \
     signal_detected_ms, order_sent_ms, order_ack_ms, \
-    bot_version, neg_risk";
+    bot_version, neg_risk, \
+    twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike";
 
 /// True if `table` already has a column named `column`, per pragma table_info.
 /// Used to guard additive migrations so re-running init is a no-op instead of
@@ -90,6 +91,11 @@ fn read_trade_row(row: &Row) -> rusqlite::Result<TradeRecord> {
         order_ack_ms: row.get(35)?,
         bot_version: row.get::<_, Option<String>>(36)?.unwrap_or_else(|| "unknown".into()),
         neg_risk: neg_risk_int.map(|v| v == 1).unwrap_or(false),
+        twap_delta_pct_at_entry: row.get(38)?,
+        twap_strike_at_entry: row.get(39)?,
+        // NULL on the 144 pre-migration rows: those all predate the flag and
+        // were produced by the spot model.
+        used_twap_strike: row.get::<_, Option<i32>>(40)?.map(|v| v == 1).unwrap_or(false),
     })
 }
 
@@ -256,6 +262,27 @@ impl Database {
         ];
         for sql in &alter_cols {
             let _ = conn.execute(sql, []);
+        }
+
+        // TWAP strike migration. Pragma-guarded and additive with NULL
+        // defaults — live history in both tables is preserved untouched.
+        // Appended at the END of `trades` so no existing positional index in
+        // TRADE_SELECT_COLS / read_trade_row shifts.
+        let strike_cols: [(&str, &str, &str); 4] = [
+            ("trades", "twap_delta_pct_at_entry", "REAL"),
+            ("trades", "twap_strike_at_entry", "TEXT"),
+            ("trades", "used_twap_strike", "INTEGER"),
+            // Lets agreement be measured on REJECTED signals too, not just
+            // entered ones.
+            ("signals", "twap_delta_pct", "REAL"),
+        ];
+        for (table, name, ty) in &strike_cols {
+            if !column_exists(&conn, table, name) {
+                let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, name, ty);
+                if let Err(e) = conn.execute(&sql, []) {
+                    error!("Failed to add {}.{}: {}", table, name, e);
+                }
+            }
         }
 
         // TWAP observation columns, added with an explicit pragma guard so a
@@ -493,7 +520,8 @@ impl Database {
                 trend_strength,
                 limit_price, fill_price, fill_attempts,
                 signal_detected_ms, order_sent_ms, order_ack_ms,
-                bot_version, neg_risk
+                bot_version, neg_risk,
+                twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10, ?11,
@@ -505,7 +533,8 @@ impl Database {
                 ?25,
                 ?26, ?27, ?28,
                 ?29, ?30, ?31,
-                ?32, ?33
+                ?32, ?33,
+                ?34, ?35, ?36
              )",
             params![
                 trade.timestamp,
@@ -541,6 +570,9 @@ impl Database {
                 trade.order_ack_ms,
                 trade.bot_version,
                 trade.neg_risk as i32,
+                trade.twap_delta_pct_at_entry,
+                trade.twap_strike_at_entry,
+                trade.used_twap_strike as i32,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -559,8 +591,9 @@ impl Database {
             "INSERT INTO signals (
                 timestamp_ms, window_ts, secs_left, btc_delta_pct,
                 ask_price, bid_price, spread, ask_depth, trade_count,
-                trend_strength, side, rejection_reason, dry_run
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                trend_strength, side, rejection_reason, dry_run,
+                twap_delta_pct
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 now_ms,
                 window_ts,
@@ -575,6 +608,7 @@ impl Database {
                 eval.side,
                 eval.rejection_reason,
                 dry_run as i32,
+                eval.twap_delta_pct,
             ],
         ) {
             error!("Failed to insert signal: {}", e);

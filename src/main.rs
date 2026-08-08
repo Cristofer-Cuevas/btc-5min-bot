@@ -272,7 +272,13 @@ async fn main() {
                     now_ms,
                 );
 
-                window_state.write().await.resolve_captured = true;
+                {
+                    let mut ws = window_state.write().await;
+                    ws.resolve_captured = true;
+                    // Coverage health: did this window's close capture actually
+                    // land a fresh reading?
+                    ws.push_twap_coverage(fresh.is_some());
+                }
 
                 info!(
                     "Boundary close capture: window={} captured_at_ms={} \
@@ -314,6 +320,9 @@ async fn main() {
                 // DATA COLLECTION ONLY: arm both captures for the new window.
                 ws.open_captured = false;
                 ws.resolve_captured = false;
+                // The strike belongs to a single window — never carry it over.
+                ws.twap_strike = None;
+                ws.twap_strike_observed_ms = None;
             }
 
             // Reset market state
@@ -404,7 +413,15 @@ async fn main() {
                 now_ms,
             );
 
-            window_state.write().await.open_captured = true;
+            {
+                let mut ws = window_state.write().await;
+                ws.open_captured = true;
+                // The strike: TWAP at window open. None when the reading was
+                // stale — never backfilled, so a stale feed yields no strike
+                // and (under USE_TWAP_STRIKE=true) no entry.
+                ws.twap_strike = fresh.as_ref().map(|(v, _)| v.clone());
+                ws.twap_strike_observed_ms = fresh.as_ref().map(|(_, obs)| *obs);
+            }
 
             info!(
                 "Boundary open capture: window={} captured_at_ms={} \
@@ -545,6 +562,10 @@ async fn main() {
                 trade_count: None,
                 trend_strength: None,
                 side: Some(retry_sig.side),
+                // A retry replays the signal that already passed every gate;
+                // no fresh evaluation runs, so there is no new TWAP delta to
+                // record. None rather than a re-derived or stale value.
+                twap_delta_pct: None,
             };
             (r, dry_run)
         } else {
@@ -566,7 +587,15 @@ async fn main() {
                 if ms.resolved {
                     EvaluationResult::rejected("market_resolved")
                 } else {
-                    strategy::evaluate_entry(&cfg, &btc, &bn, &ms, market, secs_left)
+                    strategy::evaluate_entry(
+                        &cfg,
+                        &btc,
+                        &bn,
+                        &ms,
+                        market,
+                        secs_left,
+                        ws.twap_strike.as_deref(),
+                    )
                 }
             } else {
                 EvaluationResult::rejected("no_market")
@@ -590,6 +619,35 @@ async fn main() {
             };
 
             if should_write {
+                // Shadow comparison: how the two models see this signal. Gated
+                // by should_write so it is one line per evaluated signal, not
+                // one per tick.
+                if let Some(spot_delta) = eval_result.btc_delta_pct {
+                    let side_of = |d: f64| if d > 0.0 { "Up" } else { "Down" };
+                    let spot_side = side_of(spot_delta);
+                    let twap_side = eval_result
+                        .twap_delta_pct
+                        .map(|d| side_of(d).to_string())
+                        .unwrap_or_else(|| "N/A".into());
+                    let agree = eval_result
+                        .twap_delta_pct
+                        .map(|d| (side_of(d) == spot_side).to_string())
+                        .unwrap_or_else(|| "N/A".into());
+                    info!(
+                        "delta compare: window={} spot_delta={:+.4}% twap_delta={} \
+                         spot_side={} twap_side={} agree={}",
+                        current_ts,
+                        spot_delta,
+                        eval_result
+                            .twap_delta_pct
+                            .map(|d| format!("{:+.4}%", d))
+                            .unwrap_or_else(|| "N/A".into()),
+                        spot_side,
+                        twap_side,
+                        agree,
+                    );
+                }
+
                 db.insert_signal(&eval_result, current_ts as i64, secs_left, dry_run_flag);
                 let mut ws = window_state.write().await;
                 ws.last_signal_reason = Some(reason.to_string());
@@ -658,6 +716,11 @@ async fn main() {
                 "entry",
             )
             .await;
+
+            // Which model drove this trade, and the strike it was measured
+            // against — recorded so entries from the two modes stay separable.
+            let use_twap_strike_flag = cfg.use_twap_strike;
+            let twap_strike_entry = window_state.read().await.twap_strike.clone();
 
             let limit_price = {
                 let raw = signal.ask_price + cfg.max_slippage;
@@ -795,6 +858,9 @@ async fn main() {
                 order_ack_ms: if dry_run { None } else { Some(order_ack_ms) },
                 bot_version: BOT_VERSION.to_string(),
                 neg_risk: neg_risk_val,
+                twap_delta_pct_at_entry: eval_result.twap_delta_pct,
+                twap_strike_at_entry: twap_strike_entry,
+                used_twap_strike: use_twap_strike_flag,
             };
 
             if let Err(e) = db.insert_trade(&trade) {

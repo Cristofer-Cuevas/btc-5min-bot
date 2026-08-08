@@ -35,6 +35,14 @@ pub struct RuntimeConfig {
     // Operational
     pub db_path: String,
     pub dry_run: bool,
+
+    /// When true, the entry threshold and side selection use the TWAP-based
+    /// delta (strike = TWAP at window open) instead of the Binance spot delta.
+    ///
+    /// Defaults to FALSE: shipping this must not change live trading behavior.
+    /// With it false the bot runs in shadow mode — the TWAP delta is computed
+    /// and logged, but the spot delta still drives every decision.
+    pub use_twap_strike: bool,
 }
 
 impl RuntimeConfig {
@@ -125,6 +133,20 @@ impl RuntimeConfig {
             .to_lowercase()
             == "true";
 
+        // Defaults to false: only an explicit "true" opts in.
+        let use_twap_strike = env::var("USE_TWAP_STRIKE")
+            .unwrap_or_else(|_| "false".into())
+            .to_lowercase()
+            == "true";
+        if use_twap_strike {
+            tracing::warn!(
+                "USE_TWAP_STRIKE=true: entry threshold and side selection are driven by the \
+                 TWAP delta. Entries reject with 'twap_unavailable' when the feed is stale."
+            );
+        } else {
+            tracing::info!("USE_TWAP_STRIKE=false (shadow mode): TWAP delta logged, spot delta decides");
+        }
+
         if !dry_run && poly_proxy_address.is_empty() {
             return Err("POLY_PROXY_ADDRESS is required when DRY_RUN=false".to_string());
         }
@@ -157,6 +179,7 @@ impl RuntimeConfig {
             poly_proxy_address,
             db_path,
             dry_run,
+            use_twap_strike,
         })
     }
 

@@ -20,5 +20,17 @@ pub const BOT_TICK_MS: u64 = 250;
 /// Max age for a TWAP reading to count as fresh (ms).
 pub const TWAP_MAX_AGE_MS: i64 = 60_000;
 
+/// Silence on the TWAP topic after which the subscription is re-sent on the
+/// existing socket. Also the minimum gap between re-subscribe attempts, so a
+/// genuinely dead feed cannot spam.
+pub const TWAP_RESUBSCRIBE_AFTER_MS: u64 = 45_000;
+
+/// Silence on the TWAP topic after which the whole RTDS socket is torn down and
+/// reconnected, re-establishing both the spot and TWAP subscriptions.
+pub const TWAP_RECONNECT_AFTER_MS: u64 = 120_000;
+
+/// How many recent windows the TWAP coverage counter tracks.
+pub const TWAP_COVERAGE_WINDOW: usize = 20;
+
 /// Length of a trading window in seconds.
 pub const WINDOW_SECS: i64 = 300;

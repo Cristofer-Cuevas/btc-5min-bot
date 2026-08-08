@@ -216,6 +216,37 @@ pub struct WindowState {
     /// DATA COLLECTION ONLY. Set once the outgoing window's boundary capture
     /// has run (at or after `window_ts + WINDOW_SECS`); cleared on rotation.
     pub resolve_captured: bool,
+    /// Rolling record of whether the last N windows had a FRESH TWAP at the
+    /// resolve capture point, newest at the back. Health metric for the feed
+    /// dependency, surfaced via Telegram /status.
+    ///
+    /// Deliberately NOT cleared on rotation — it spans windows by design.
+    pub twap_coverage_recent: VecDeque<bool>,
+    /// The window's strike: the TWAP at window open, as the raw E18 string.
+    /// `None` when the open capture found no fresh reading — never backfilled.
+    /// Cleared on rotation.
+    pub twap_strike: Option<String>,
+    /// Chainlink observation time of `twap_strike`.
+    pub twap_strike_observed_ms: Option<i64>,
+}
+
+impl WindowState {
+    /// Record whether this window's resolve capture found a fresh TWAP,
+    /// evicting the oldest sample beyond `TWAP_COVERAGE_WINDOW`.
+    pub fn push_twap_coverage(&mut self, fresh: bool) {
+        self.twap_coverage_recent.push_back(fresh);
+        while self.twap_coverage_recent.len() > crate::constants::TWAP_COVERAGE_WINDOW {
+            self.twap_coverage_recent.pop_front();
+        }
+    }
+
+    /// (fresh_count, sample_count) over the tracked windows.
+    pub fn twap_coverage(&self) -> (usize, usize) {
+        (
+            self.twap_coverage_recent.iter().filter(|f| **f).count(),
+            self.twap_coverage_recent.len(),
+        )
+    }
 }
 
 // ── Trade Record (for DB) ──
@@ -263,6 +294,14 @@ pub struct TradeRecord {
     // Bot metadata
     pub bot_version: String,
     pub neg_risk: bool,
+    // TWAP strike comparison
+    /// TWAP-based delta at entry. Recorded in both modes.
+    pub twap_delta_pct_at_entry: Option<f64>,
+    /// The window's TWAP strike, raw E18 string.
+    pub twap_strike_at_entry: Option<String>,
+    /// Which model produced this trade: true = TWAP delta drove the threshold
+    /// and side, false = Binance spot delta did.
+    pub used_twap_strike: bool,
 }
 
 // ── Strategy Evaluation Result ──
@@ -279,6 +318,10 @@ pub struct EvaluationResult {
     pub trade_count: Option<u32>,
     pub trend_strength: Option<f64>,
     pub side: Option<String>,
+    /// TWAP-based delta vs the window's strike. Always computed when available,
+    /// regardless of `use_twap_strike` — under the default (false) it is
+    /// recorded for comparison only and drives nothing.
+    pub twap_delta_pct: Option<f64>,
 }
 
 impl EvaluationResult {
@@ -294,6 +337,7 @@ impl EvaluationResult {
             trade_count: None,
             trend_strength: None,
             side: None,
+            twap_delta_pct: None,
         }
     }
 }
@@ -464,6 +508,39 @@ mod rtds_tests {
     }
 
     #[test]
+    fn twap_delta_pct_is_exact() {
+        // 65000 -> 65065 is exactly +0.1%
+        let strike = "65000000000000000000000";
+        let cur = "65065000000000000000000";
+        assert_eq!(twap_delta_pct(strike, cur).unwrap(), 0.1);
+
+        // Reverse direction: -65/65065*100 = -0.0999000999...
+        let back = twap_delta_pct(cur, strike).unwrap();
+        assert!((back - -0.0999000999000999).abs() < 1e-15, "got {}", back);
+
+        // No move at all.
+        assert_eq!(twap_delta_pct(strike, strike).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn twap_delta_pct_resolves_sub_cent_moves() {
+        // The single miss in the collected data turned on $0.11. A delta this
+        // small must still carry the correct sign and magnitude.
+        let strike = "65000000000000000000000"; // 65000.00
+        let cur = "65000110000000000000000"; //    65000.11
+        let d = twap_delta_pct(strike, cur).unwrap();
+        assert!(d > 0.0, "sign lost on a $0.11 move: {}", d);
+        assert!((d - 0.000169230769).abs() < 1e-12, "got {}", d);
+    }
+
+    #[test]
+    fn twap_delta_pct_rejects_bad_input() {
+        assert_eq!(twap_delta_pct("0", "65000000000000000000000"), None);
+        assert_eq!(twap_delta_pct("abc", "65000000000000000000000"), None);
+        assert_eq!(twap_delta_pct("65000000000000000000000", "12.5"), None);
+    }
+
+    #[test]
     fn format_e18_preserves_full_precision() {
         assert_eq!(format_e18("65000500000000000000000").unwrap(), "65000.5");
         assert_eq!(
@@ -478,6 +555,32 @@ mod rtds_tests {
         assert_eq!(format_e18("abc"), None);
         assert_eq!(format_e18(""), None);
     }
+}
+
+/// Percentage change from `strike_e18` to `current_e18`, both raw signed E18
+/// fixed-point strings from the TWAP feed.
+///
+/// The arithmetic runs entirely in `Decimal` — the E18 strings are converted to
+/// exact decimal values via [`format_e18`] (lossless string manipulation) and
+/// never pass through f64. Only the final percentage, which is compared against
+/// an f64 threshold, is narrowed on return.
+///
+/// Returns `None` if either value is unparseable or the strike is zero.
+pub fn twap_delta_pct(strike_e18: &str, current_e18: &str) -> Option<f64> {
+    use rust_decimal::prelude::ToPrimitive;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let strike = Decimal::from_str(&format_e18(strike_e18)?).ok()?;
+    let current = Decimal::from_str(&format_e18(current_e18)?).ok()?;
+    if strike.is_zero() {
+        return None;
+    }
+
+    let delta = (current - strike)
+        .checked_div(strike)?
+        .checked_mul(Decimal::from(100))?;
+    delta.to_f64()
 }
 
 // ── CLOB WebSocket Messages ──

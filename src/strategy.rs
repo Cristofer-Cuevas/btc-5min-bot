@@ -15,6 +15,7 @@ pub fn evaluate_entry(
     market: &MarketState,
     window: &MarketWindow,
     secs_left: i64,
+    twap_strike: Option<&str>,
 ) -> EvaluationResult {
     let mut r = EvaluationResult::rejected("entered");
 
@@ -33,9 +34,38 @@ pub fn evaluate_entry(
 
     let delta_pct = ((bn_current - bn_open) / bn_open) * 100.0;
     r.btc_delta_pct = Some(delta_pct);
-    r.side = Some(if delta_pct > 0.0 { "Up" } else { "Down" }.into());
 
-    if delta_pct.abs() < config.btc_threshold_pct {
+    // TWAP delta vs the window's strike (TWAP at window open). Computed in both
+    // modes: under the default it is recorded for comparison and drives nothing.
+    // Both sides must be fresh — fresh_twap_30 returns None on a stale reading,
+    // so a silent feed can never produce a delta against a backfilled price.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    r.twap_delta_pct = twap_strike.and_then(|strike| {
+        let (current, _) = btc.fresh_twap_30(now_ms, TWAP_MAX_AGE_MS)?;
+        crate::types::twap_delta_pct(strike, &current)
+    });
+
+    // Which delta drives the threshold and side selection. With
+    // use_twap_strike == false this is the spot delta, making every downstream
+    // comparison identical to the previous behavior.
+    let decision_delta = if config.use_twap_strike {
+        match r.twap_delta_pct {
+            Some(d) => d,
+            None => {
+                // Fail closed. Falling back to the spot delta here would make
+                // the two modes indistinguishable in the data and hide feed
+                // outages behind apparently-normal trading.
+                r.rejection_reason = "twap_unavailable";
+                return r;
+            }
+        }
+    } else {
+        delta_pct
+    };
+
+    r.side = Some(if decision_delta > 0.0 { "Up" } else { "Down" }.into());
+
+    if decision_delta.abs() < config.btc_threshold_pct {
         r.rejection_reason = "below_threshold";
         return r;
     }
@@ -87,7 +117,7 @@ pub fn evaluate_entry(
         info!("RTDS stale (>{}ms), using Binance alone", RTDS_STALE_MS);
     }
 
-    let (side, token_id, book) = if delta_pct > 0.0 {
+    let (side, token_id, book) = if decision_delta > 0.0 {
         ("Up", &window.up_token_id, &market.up_book)
     } else {
         ("Down", &window.down_token_id, &market.down_book)
@@ -177,4 +207,155 @@ pub fn evaluate_entry(
     });
     r.rejection_reason = "entered";
     r
+}
+
+#[cfg(test)]
+mod strike_mode_tests {
+    use super::*;
+    use crate::types::TokenBook;
+
+    fn cfg(use_twap_strike: bool) -> RuntimeConfig {
+        RuntimeConfig {
+            poly_private_key: String::new(),
+            poly_address: String::new(),
+            poly_api_key: String::new(),
+            poly_api_secret: String::new(),
+            poly_api_passphrase: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: 0,
+            btc_threshold_pct: 0.07,
+            max_ask_price: 0.80,
+            max_spread: 0.10,
+            bet_shares: 5.0,
+            max_slippage: 0.03,
+            min_trend_strength: 0.41,
+            max_consecutive_losses: 3,
+            daily_loss_limit_usdc: 20.0,
+            poly_proxy_address: String::new(),
+            db_path: ":memory:".into(),
+            dry_run: true,
+            use_twap_strike,
+        }
+    }
+
+    /// Spot delta of +0.20% (well past the 0.07% threshold).
+    fn binance_up() -> BinanceBtcPrice {
+        BinanceBtcPrice {
+            current_price: Some(65_130.0),
+            window_open_price: Some(65_000.0),
+            ..Default::default()
+        }
+    }
+
+    /// TWAP currently BELOW the strike, i.e. the opposite direction to spot.
+    fn btc_twap_down() -> BtcPriceState {
+        BtcPriceState {
+            twap_30_value: Some("64800000000000000000000".into()), // 64800
+            twap_30_observed_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            ..Default::default()
+        }
+    }
+
+    const STRIKE: &str = "65000000000000000000000"; // 65000
+
+    fn market() -> (MarketState, MarketWindow) {
+        (
+            MarketState::default(),
+            MarketWindow {
+                up_token_id: "up".into(),
+                down_token_id: "down".into(),
+                neg_risk: false,
+                tick_size: "0.01".into(),
+            },
+        )
+    }
+
+    fn eval(config_flag: bool, strike: Option<&str>) -> EvaluationResult {
+        let (ms, win) = market();
+        evaluate_entry(
+            &cfg(config_flag),
+            &btc_twap_down(),
+            &binance_up(),
+            &ms,
+            &win,
+            60,
+            strike,
+        )
+    }
+
+    /// The core safety property: with the flag off, a TWAP strike pointing the
+    /// other way must not influence the decision at all.
+    #[test]
+    fn shadow_mode_decision_is_unaffected_by_twap() {
+        let with_strike = eval(false, Some(STRIKE));
+        let without_strike = eval(false, None);
+
+        // Spot said Up; TWAP said Down. Shadow mode must still say Up.
+        assert_eq!(with_strike.side.as_deref(), Some("Up"));
+        assert_eq!(with_strike.side, without_strike.side);
+        assert_eq!(
+            with_strike.rejection_reason,
+            without_strike.rejection_reason,
+            "presence of a TWAP strike changed the outcome in shadow mode"
+        );
+        // ...and the TWAP delta is still recorded for comparison.
+        let d = with_strike.twap_delta_pct.expect("twap delta recorded");
+        assert!(d < 0.0, "twap delta should be negative, got {}", d);
+        assert_eq!(without_strike.twap_delta_pct, None);
+    }
+
+    /// With the flag on, the TWAP delta drives the side instead.
+    #[test]
+    fn twap_mode_side_follows_twap_delta() {
+        let r = eval(true, Some(STRIKE));
+        assert_eq!(r.side.as_deref(), Some("Down"));
+    }
+
+    /// Fail closed: no silent fallback to the spot delta.
+    #[test]
+    fn twap_mode_rejects_when_strike_missing() {
+        assert_eq!(eval(true, None).rejection_reason, "twap_unavailable");
+    }
+
+    /// A stale TWAP reading must not produce a delta, even with a strike set.
+    #[test]
+    fn twap_mode_rejects_on_stale_reading() {
+        let stale = BtcPriceState {
+            twap_30_value: Some("64800000000000000000000".into()),
+            twap_30_observed_at_ms: Some(
+                chrono::Utc::now().timestamp_millis() - TWAP_MAX_AGE_MS - 1,
+            ),
+            ..Default::default()
+        };
+        let (ms, win) = market();
+        let r = evaluate_entry(&cfg(true), &stale, &binance_up(), &ms, &win, 60, Some(STRIKE));
+        assert_eq!(r.rejection_reason, "twap_unavailable");
+        assert_eq!(r.twap_delta_pct, None);
+    }
+
+    /// Below-threshold behavior is still governed by the spot delta in shadow
+    /// mode, even when the TWAP delta would clear the threshold.
+    #[test]
+    fn shadow_mode_threshold_uses_spot_delta() {
+        let flat_spot = BinanceBtcPrice {
+            current_price: Some(65_000.65), // +0.001%, under the 0.07% threshold
+            window_open_price: Some(65_000.0),
+            ..Default::default()
+        };
+        let (ms, win) = market();
+        let r = evaluate_entry(
+            &cfg(false),
+            &btc_twap_down(), // TWAP delta ≈ -0.31%, would clear the threshold
+            &flat_spot,
+            &ms,
+            &win,
+            60,
+            Some(STRIKE),
+        );
+        assert_eq!(r.rejection_reason, "below_threshold");
+        assert_eq!(r.side.as_deref(), Some("Up"));
+        // Unused for the decision, but still recorded.
+        assert!(r.twap_delta_pct.unwrap() < -0.3);
+        let _ = TokenBook::default();
+    }
 }
