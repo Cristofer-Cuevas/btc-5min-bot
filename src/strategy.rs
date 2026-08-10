@@ -423,6 +423,91 @@ mod strike_mode_tests {
         assert_eq!(r.rejection_reason, "no_ask");
     }
 
+    /// A book with a fillable ask ladder, so evaluation can run past the
+    /// book-dependent gates.
+    fn book_with_asks() -> TokenBook {
+        TokenBook {
+            best_bid: Some(0.48),
+            best_ask: Some(0.50),
+            last_trade_price: Some(0.50),
+            ask_depth: Some(500.0),
+            bid_depth: Some(500.0),
+            ask_levels: vec![(0.50, 300.0), (0.51, 300.0)],
+        }
+    }
+
+    /// Regression: `resolved` is window-scoped shared state. If it survives a
+    /// rotation, every later evaluation short-circuits on "market_resolved" and
+    /// the bot can never enter again.
+    #[test]
+    fn rotation_clears_resolved_flag() {
+        let mut ms = MarketState {
+            resolved: true,
+            winning_outcome: Some("Up".into()),
+            up_trade_count: 7,
+            down_trade_count: 9,
+            up_book: book_with_asks(),
+            down_book: book_with_asks(),
+        };
+
+        ms.reset_for_new_window();
+
+        assert!(!ms.resolved, "resolved must be cleared on rotation");
+        assert_eq!(ms.winning_outcome, None);
+        assert_eq!(ms.up_trade_count, 0);
+        assert_eq!(ms.down_trade_count, 0);
+        // Books are window-scoped too: their prices belong to token ids that no
+        // longer exist after rotation.
+        assert_eq!(ms.up_book.best_ask, None);
+        assert_eq!(ms.down_book.best_ask, None);
+        assert!(ms.up_book.ask_levels.is_empty());
+        assert_eq!(ms.up_book.ask_depth_up_to(0.99), 0.0);
+    }
+
+    /// ...and after that rotation, evaluation proceeds instead of bailing out.
+    #[test]
+    fn evaluate_entry_proceeds_after_rotation_clears_resolved() {
+        let mut ms = MarketState {
+            resolved: true,
+            ..Default::default()
+        };
+        let (_, win) = market();
+
+        // Before the reset, evaluation short-circuits.
+        let before = evaluate_entry(
+            &cfg(false),
+            &btc_rtds_disagrees(),
+            &binance_up_trending(),
+            &ms,
+            &win,
+            60,
+            Some(STRIKE),
+        );
+        assert_eq!(before.rejection_reason, "market_resolved");
+
+        // After it, the same otherwise-valid inputs get a real evaluation.
+        ms.reset_for_new_window();
+        ms.up_book = book_with_asks();
+        ms.down_book = book_with_asks();
+
+        let after = evaluate_entry(
+            &cfg(false),
+            &btc_rtds_disagrees(),
+            &binance_up_trending(),
+            &ms,
+            &win,
+            60,
+            Some(STRIKE),
+        );
+        assert_ne!(
+            after.rejection_reason, "market_resolved",
+            "evaluation still short-circuits after rotation"
+        );
+        // Reaches the real gates: these inputs disagree on direction, so the
+        // (unchanged) RTDS gate is what stops it now.
+        assert_eq!(after.rejection_reason, "rtds_mismatch");
+    }
+
     /// Below-threshold behavior is still governed by the spot delta in shadow
     /// mode, even when the TWAP delta would clear the threshold.
     #[test]

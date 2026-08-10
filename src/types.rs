@@ -47,6 +47,9 @@ impl TokenBook {
     }
 }
 
+/// Shared across windows and mutated by the CLOB WebSocket task. EVERY field
+/// here carries meaning for exactly one window, so all of them must be cleared
+/// on rotation — see [`MarketState::reset_for_new_window`].
 #[derive(Debug, Clone, Default)]
 pub struct MarketState {
     pub up_book: TokenBook,
@@ -55,6 +58,22 @@ pub struct MarketState {
     pub winning_outcome: Option<String>,
     pub up_trade_count: u32,
     pub down_trade_count: u32,
+}
+
+impl MarketState {
+    /// Clear all per-window state at rotation.
+    ///
+    /// Every field is window-scoped: `resolved`/`winning_outcome` describe one
+    /// market, the trade counts are per-window activity, and the books hold
+    /// prices for token ids that cease to exist when the window turns. Leaving
+    /// any of them set lets the previous window's data drive the next window's
+    /// decisions.
+    ///
+    /// Equivalent to assigning `Self::default()`, but named so the intent is
+    /// explicit and the behavior is directly testable.
+    pub fn reset_for_new_window(&mut self) {
+        *self = Self::default();
+    }
 }
 
 // ── TWAP Source ──

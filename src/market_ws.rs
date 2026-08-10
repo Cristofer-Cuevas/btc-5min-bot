@@ -73,12 +73,15 @@ pub async fn run_clob_ws(
                         let _ = w.send(Message::Text(msg)).await;
                         info!("Re-subscribed to tokens on reconnect");
                     }
-                    // Reset trade counts to avoid phantom trades from replayed book data
+                    // Reset trade counts and books to avoid phantom trades and
+                    // stale prices from replayed book data after a reconnect.
                     {
                         let mut ms = market_state.write().await;
                         ms.up_trade_count = 0;
                         ms.down_trade_count = 0;
-                        debug!("Reset trade counts on (re)subscribe");
+                        ms.up_book = Default::default();
+                        ms.down_book = Default::default();
+                        debug!("Reset trade counts and books on (re)subscribe");
                     }
                 }
 
@@ -132,12 +135,29 @@ pub async fn run_clob_ws(
                                         }
                                     }
                                     *shared_tokens.lock().await = Some((up_token_id, down_token_id));
-                                    // Reset trade counts on subscribe to avoid phantom trades
+                                    // Reset trade counts on subscribe to avoid phantom trades.
+                                    //
+                                    // The books are cleared here too. Between window rotation
+                                    // and this command being processed, `shared_tokens` still
+                                    // held the OLD token ids, so late `book`/`price_change`
+                                    // events for the previous window's tokens passed the
+                                    // is_up/is_down check and repopulated the books that
+                                    // rotation had just cleared. Clearing at the moment the new
+                                    // subscription is issued discards that carry-over.
+                                    //
+                                    // Safe to clear: the server sends a fresh `book` snapshot
+                                    // for the new tokens, and until it lands best_ask is None,
+                                    // so evaluate_entry rejects with "no_ask" and
+                                    // ask_depth_up_to returns 0.0 to fail the depth gate. A
+                                    // brief no-trade gap is strictly better than quoting prices
+                                    // for tokens that no longer exist.
                                     {
                                         let mut ms = market_state.write().await;
                                         ms.up_trade_count = 0;
                                         ms.down_trade_count = 0;
-                                        debug!("Reset trade counts on (re)subscribe");
+                                        ms.up_book = Default::default();
+                                        ms.down_book = Default::default();
+                                        debug!("Reset trade counts and books on (re)subscribe");
                                     }
                                 }
                                 None => {
@@ -269,10 +289,38 @@ async fn handle_clob_message(
             }
             "market_resolved" => {
                 info!("Market resolved! outcome={:?}", msg.winning_outcome);
-                let mut state = market_state.write().await;
-                state.resolved = true;
-                state.winning_outcome = msg.winning_outcome.clone();
 
+                // Does this resolution belong to the window we are CURRENTLY
+                // trading? Resolutions arrive minutes after their window closed
+                // (measured: ~145-160s), by which time the next window is well
+                // under way. Setting the shared `resolved` flag from a previous
+                // window's event marks the live market as resolved and blocks
+                // every remaining entry in it.
+                //
+                // The flag is therefore only set for an event naming one of the
+                // tokens we are subscribed to right now.
+                let belongs_to_current = is_up
+                    || is_down
+                    || msg
+                        .winning_asset_id
+                        .as_deref()
+                        .is_some_and(|a| a == up_token || a == down_token);
+
+                if belongs_to_current {
+                    let mut state = market_state.write().await;
+                    state.resolved = true;
+                    state.winning_outcome = msg.winning_outcome.clone();
+                } else {
+                    info!(
+                        "Ignoring resolution for asset {:?} — not a token of the current \
+                         window; forwarding for settlement only",
+                        msg.winning_asset_id
+                    );
+                }
+
+                // Forwarded either way: the main loop maps the winning asset
+                // back to its own window via the token→window map to settle the
+                // right trade, and late resolutions are exactly what it expects.
                 if let (Some(outcome), Some(asset_id)) =
                     (msg.winning_outcome, msg.winning_asset_id)
                 {
@@ -298,3 +346,62 @@ fn best_price(levels: &Option<Vec<ClobBookLevel>>, is_bid: bool) -> Option<f64> 
     })
 }
 
+#[cfg(test)]
+mod resolution_scope_tests {
+    use super::*;
+    use crate::types::MarketState;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    const UP: &str = "up-token-current";
+    const DOWN: &str = "down-token-current";
+
+    async fn feed(json: &str) -> (bool, Option<ResolutionEvent>) {
+        let ms: SharedMarketState = Arc::new(RwLock::new(MarketState::default()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let tokens = Some((UP.to_string(), DOWN.to_string()));
+        handle_clob_message(json, &ms, &tx, &tokens).await;
+        let resolved = ms.read().await.resolved;
+        (resolved, rx.try_recv().ok())
+    }
+
+    /// The bug: a resolution for a PREVIOUS window arrives minutes late
+    /// (measured ~145-160s into the next window) and must not mark the live
+    /// market resolved — that blocks every remaining entry in it.
+    #[tokio::test]
+    async fn foreign_resolution_does_not_mark_current_window_resolved() {
+        let (resolved, forwarded) = feed(
+            r#"[{"event_type":"market_resolved","winning_outcome":"Up",
+                 "winning_asset_id":"some-older-windows-token"}]"#,
+        )
+        .await;
+        assert!(!resolved, "a previous window's resolution poisoned the live window");
+        // Still forwarded so the main loop can settle the trade it belongs to.
+        let ev = forwarded.expect("resolution must still be forwarded for settlement");
+        assert_eq!(ev.winning_asset_id, "some-older-windows-token");
+        assert_eq!(ev.winning_outcome, "Up");
+    }
+
+    /// A resolution for the window we are actually trading still sets the flag.
+    #[tokio::test]
+    async fn own_resolution_marks_current_window_resolved() {
+        let json = format!(
+            r#"[{{"event_type":"market_resolved","winning_outcome":"Down","winning_asset_id":"{}"}}]"#,
+            DOWN
+        );
+        let (resolved, forwarded) = feed(&json).await;
+        assert!(resolved, "own resolution must mark the window resolved");
+        assert_eq!(forwarded.expect("forwarded").winning_asset_id, DOWN);
+    }
+
+    /// Matching on the event's own asset_id works too.
+    #[tokio::test]
+    async fn own_resolution_via_asset_id_field() {
+        let json = format!(
+            r#"[{{"event_type":"market_resolved","asset_id":"{}","winning_outcome":"Up",
+                  "winning_asset_id":"{}"}}]"#,
+            UP, UP
+        );
+        assert!(feed(&json).await.0);
+    }
+}

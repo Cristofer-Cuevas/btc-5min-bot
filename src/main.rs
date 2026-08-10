@@ -329,10 +329,20 @@ async fn main() {
                 ws.twap_strike_observed_ms = None;
             }
 
-            // Reset market state
+            // Reset market state. MarketState is shared across windows and
+            // written by the CLOB task, so every per-window field — `resolved`,
+            // `winning_outcome`, both trade counts, and both books — is cleared
+            // here. The write lock is taken and released inside this block, with
+            // no await held across it, so it cannot deadlock the CLOB task.
+            //
+            // Placed AFTER the boundary close-capture block above: that block
+            // reads btc_price/window_state (never market_state) for the OUTGOING
+            // window, so clearing here cannot clobber anything it still needs.
+            // It must also run on every rotation — including when discovery
+            // below fails — so one bad window cannot poison later ones.
             {
                 let mut ms = market_state.write().await;
-                *ms = MarketState::default();
+                ms.reset_for_new_window();
             }
 
             // Record window open price (RTDS/Chainlink)
