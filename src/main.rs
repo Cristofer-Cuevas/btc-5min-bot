@@ -35,6 +35,57 @@ use crate::types::*;
 
 const BOT_VERSION: &str = env!("BOT_GIT_HASH");
 
+/// SHADOW / DATA COLLECTION ONLY. Gathers the Binance-vs-Chainlink TWAP
+/// comparison context written with every signal row.
+///
+/// Locks are acquired and released one at a time rather than held together:
+/// tokio's RwLock is write-preferring, so overlapping read guards taken while a
+/// writer is queued can deadlock against the feed tasks.
+async fn build_signal_context(
+    binance_price: &SharedBinancePrice,
+    btc_price: &SharedBtcPrice,
+    window_state: &SharedWindowState,
+) -> SignalShadowContext {
+    let mut ctx = SignalShadowContext {
+        signal_evaluated_at_ms: chrono::Utc::now().timestamp_millis(),
+        ..Default::default()
+    };
+
+    {
+        let bn = binance_price.read().await;
+        ctx.binance_spot_price = bn.current_price;
+        ctx.binance_twap_value = bn.twap(BINANCE_TWAP_WINDOW_MS);
+        ctx.binance_buffer_samples = Some(bn.price_buffer.len() as i64);
+        // Buffer health, so a missing or poor estimate can be attributed to a
+        // thin buffer (e.g. post-reconnect) rather than genuine divergence.
+        if let (Some((oldest, _)), Some((newest, _))) =
+            (bn.price_buffer.front(), bn.price_buffer.back())
+        {
+            ctx.binance_buffer_span_ms = Some(newest.saturating_sub(*oldest) as i64);
+            ctx.binance_newest_sample_ms = Some(*newest as i64);
+        }
+    }
+
+    {
+        let btc = btc_price.read().await;
+        ctx.chainlink_twap_value = btc.twap_30_value.clone();
+        ctx.chainlink_twap_observed_ms = btc.twap_30_observed_at_ms;
+    }
+
+    {
+        let ws = window_state.read().await;
+        ctx.chainlink_twap_strike = ws.twap_strike.clone();
+        ctx.binance_twap_strike = ws.binance_twap_strike;
+    }
+
+    ctx.binance_twap_delta_pct = match (ctx.binance_twap_strike, ctx.binance_twap_value) {
+        (Some(strike), Some(current)) => types::binance_twap_delta_pct(strike, current),
+        _ => None,
+    };
+
+    ctx
+}
+
 /// DATA COLLECTION ONLY. Returns the current TWAP reading only if it is fresh,
 /// otherwise `None` so the caller writes NULL.
 ///
@@ -274,6 +325,8 @@ async fn main() {
                     snapshot_close,
                     now_ms,
                     close_source.map(|s| s.as_str()),
+                    // SHADOW ONLY: Binance close, at this same existing point.
+                    binance_price.read().await.twap(BINANCE_TWAP_WINDOW_MS),
                 );
 
                 {
@@ -327,6 +380,9 @@ async fn main() {
                 // The strike belongs to a single window — never carry it over.
                 ws.twap_strike = None;
                 ws.twap_strike_observed_ms = None;
+                // SHADOW ONLY: same for the Binance-derived strike.
+                ws.binance_twap_strike = None;
+                ws.binance_twap_strike_ms = None;
             }
 
             // Reset market state. MarketState is shared across windows and
@@ -419,6 +475,10 @@ async fn main() {
             let fresh = fresh_twap_for_capture(&btc_price, now_ms, "open").await;
             let snapshot_open = btc_price.read().await.current_price;
             let boundary_ms = current_ts as i64 * 1000;
+            // SHADOW ONLY: Binance-derived strike, captured at this same
+            // existing boundary point. None when the buffer is too short —
+            // never a partial or padded value.
+            let binance_twap_open = binance_price.read().await.twap(BINANCE_TWAP_WINDOW_MS);
 
             // The observation record keeps whatever was seen, so the collected
             // dataset stays complete and skew can be recomputed in SQL from
@@ -430,6 +490,7 @@ async fn main() {
                 snapshot_open,
                 now_ms,
                 fresh.as_ref().and_then(|(_, _, s)| *s).map(|s| s.as_str()),
+                binance_twap_open,
             );
 
             // Boundary invariant for the STRIKE specifically. The feed
@@ -477,6 +538,9 @@ async fn main() {
                 // yields no strike and (under USE_TWAP_STRIKE=true) no entry.
                 ws.twap_strike = strike.as_ref().map(|(v, _)| v.clone());
                 ws.twap_strike_observed_ms = strike.as_ref().map(|(_, obs)| *obs);
+                // SHADOW ONLY.
+                ws.binance_twap_strike = binance_twap_open;
+                ws.binance_twap_strike_ms = binance_twap_open.map(|_| now_ms);
             }
 
             info!(
@@ -620,8 +684,11 @@ async fn main() {
                 side: Some(retry_sig.side),
                 // A retry replays the signal that already passed every gate;
                 // no fresh evaluation runs, so there is no new TWAP delta to
-                // record. None rather than a re-derived or stale value.
+                // record. None rather than a re-derived or stale value. The
+                // shadow context still supplies the Binance figures at write
+                // time, so the row is not left empty.
                 twap_delta_pct: None,
+                binance_twap_delta_pct: None,
             };
             (r, dry_run)
         } else {
@@ -651,6 +718,7 @@ async fn main() {
                         market,
                         secs_left,
                         ws.twap_strike.as_deref(),
+                        ws.binance_twap_strike,
                     )
                 }
             } else {
@@ -704,7 +772,15 @@ async fn main() {
                     );
                 }
 
-                db.insert_signal(&eval_result, current_ts as i64, secs_left, dry_run_flag);
+                let sig_ctx =
+                    build_signal_context(&binance_price, &btc_price, &window_state).await;
+                db.insert_signal(
+                    &eval_result,
+                    current_ts as i64,
+                    secs_left,
+                    dry_run_flag,
+                    &sig_ctx,
+                );
                 let mut ws = window_state.write().await;
                 ws.last_signal_reason = Some(reason.to_string());
             }
@@ -712,9 +788,29 @@ async fn main() {
 
         if let Some(ref signal) = eval_result.signal {
             if !is_retry {
+                // `signal.btc_delta_pct` is ALWAYS the Binance spot delta, but
+                // the side comes from whichever delta the flag selects. Printing
+                // only the spot delta made TWAP-mode entries look inverted
+                // ("Down" beside a positive delta), so both are shown along with
+                // which one actually decided.
+                let decided_by = if shared_config.read().await.use_twap_strike {
+                    "twap"
+                } else {
+                    "spot"
+                };
                 info!(
-                    "ENTRY SIGNAL: {} | BTC Δ: {:+.4}% | Ask: ${:.2} | Spread: ${:.2} | {}s left",
-                    signal.side, signal.btc_delta_pct, signal.ask_price, signal.spread, signal.secs_left
+                    "ENTRY SIGNAL: {} (decided by {} delta) | spot Δ: {:+.4}% | twap Δ: {} | \
+                     Ask: ${:.2} | Spread: ${:.2} | {}s left",
+                    signal.side,
+                    decided_by,
+                    signal.btc_delta_pct,
+                    eval_result
+                        .twap_delta_pct
+                        .map(|d| format!("{:+.6}%", d))
+                        .unwrap_or_else(|| "N/A".into()),
+                    signal.ask_price,
+                    signal.spread,
+                    signal.secs_left
                 );
             }
 
@@ -776,7 +872,10 @@ async fn main() {
             // Which model drove this trade, and the strike it was measured
             // against — recorded so entries from the two modes stay separable.
             let use_twap_strike_flag = cfg.use_twap_strike;
-            let twap_strike_entry = window_state.read().await.twap_strike.clone();
+            let (twap_strike_entry, binance_twap_strike_entry) = {
+                let ws = window_state.read().await;
+                (ws.twap_strike.clone(), ws.binance_twap_strike)
+            };
 
             let limit_price = {
                 let raw = signal.ask_price + cfg.max_slippage;
@@ -831,7 +930,15 @@ async fn main() {
                             signal: None,
                             ..eval_result.clone()
                         };
-                        db.insert_signal(&failed_signal, current_ts as i64, secs_left, dry_run);
+                        let sig_ctx =
+                            build_signal_context(&binance_price, &btc_price, &window_state).await;
+                        db.insert_signal(
+                            &failed_signal,
+                            current_ts as i64,
+                            secs_left,
+                            dry_run,
+                            &sig_ctx,
+                        );
                         let msg = format!("⚠️ Order failed: {}", e);
                         telegram::notify(&shared_config, &msg).await;
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -867,7 +974,15 @@ async fn main() {
                     signal: None,
                     ..eval_result
                 };
-                db.insert_signal(&unmatched_signal, current_ts as i64, secs_left, dry_run);
+                let sig_ctx =
+                    build_signal_context(&binance_price, &btc_price, &window_state).await;
+                db.insert_signal(
+                    &unmatched_signal,
+                    current_ts as i64,
+                    secs_left,
+                    dry_run,
+                    &sig_ctx,
+                );
                 let msg = format!("⚠️ FAK not filled (order {})", fill.order_id);
                 telegram::notify(&shared_config, &msg).await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -921,6 +1036,9 @@ async fn main() {
                     .as_ref()
                     .and_then(|(_, _, s)| *s)
                     .map(|s| s.as_str().to_string()),
+                // SHADOW ONLY — recorded, never consulted.
+                binance_twap_delta_at_entry: eval_result.binance_twap_delta_pct,
+                binance_twap_strike_at_entry: binance_twap_strike_entry,
             };
 
             if let Err(e) = db.insert_trade(&trade) {
@@ -936,7 +1054,14 @@ async fn main() {
                 &signal.side,
             );
 
-            db.insert_signal(&eval_result, current_ts as i64, secs_left, dry_run);
+            let sig_ctx = build_signal_context(&binance_price, &btc_price, &window_state).await;
+            db.insert_signal(
+                &eval_result,
+                current_ts as i64,
+                secs_left,
+                dry_run,
+                &sig_ctx,
+            );
 
             // Mark entered, clear any pending retry intent
             {

@@ -8,6 +8,9 @@ use crate::types::{
 
 /// Evaluate Strategy A entry conditions.
 /// Returns EvaluationResult with signal on success, or rejection diagnostics.
+// Each parameter is a distinct piece of shared state read by the evaluation;
+// bundling them would obscure which state the decision actually depends on.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_entry(
     config: &RuntimeConfig,
     btc: &BtcPriceState,
@@ -16,6 +19,7 @@ pub fn evaluate_entry(
     window: &MarketWindow,
     secs_left: i64,
     twap_strike: Option<&str>,
+    binance_twap_strike: Option<f64>,
 ) -> EvaluationResult {
     let mut r = EvaluationResult::rejected("entered");
 
@@ -34,6 +38,15 @@ pub fn evaluate_entry(
 
     let delta_pct = ((bn_current - bn_open) / bn_open) * 100.0;
     r.btc_delta_pct = Some(delta_pct);
+
+    // SHADOW ONLY — computed here so it is recorded alongside the deltas that
+    // do drive decisions, but deliberately never read below this line. Nothing
+    // in the gates, threshold, side selection, or ordering consults it; the
+    // shadow test asserts the decision is identical with and without it.
+    r.binance_twap_delta_pct = binance_twap_strike.and_then(|strike| {
+        let current = binance.twap(BINANCE_TWAP_WINDOW_MS)?;
+        crate::types::binance_twap_delta_pct(strike, current)
+    });
 
     // TWAP delta vs the window's strike (TWAP at window open). Computed in both
     // modes: under the default it is recorded for comparison and drives nothing.
@@ -290,6 +303,7 @@ mod strike_mode_tests {
             &win,
             60,
             strike,
+            None,
         )
     }
 
@@ -338,7 +352,7 @@ mod strike_mode_tests {
             ..Default::default()
         };
         let (ms, win) = market();
-        let r = evaluate_entry(&cfg(true), &stale, &binance_up(), &ms, &win, 60, Some(STRIKE));
+        let r = evaluate_entry(&cfg(true), &stale, &binance_up(), &ms, &win, 60, Some(STRIKE), None);
         assert_eq!(r.rejection_reason, "twap_unavailable");
         assert_eq!(r.twap_delta_pct, None);
     }
@@ -379,6 +393,62 @@ mod strike_mode_tests {
         }
     }
 
+    /// SHADOW INVARIANCE: supplying a Binance TWAP strike — including one whose
+    /// delta points the OPPOSITE way to the deciding delta — must not change
+    /// the entry decision in either mode. Mirrors
+    /// `shadow_mode_decision_is_unaffected_by_twap`.
+    #[test]
+    fn binance_twap_never_affects_the_decision() {
+        for flag in [false, true] {
+            for secs in [60, 100] {
+                let (ms, win) = market();
+                let without = evaluate_entry(
+                    &cfg(flag),
+                    &btc_twap_down(),
+                    &binance_up_trending(),
+                    &ms,
+                    &win,
+                    secs,
+                    Some(STRIKE),
+                    None,
+                );
+                // A strike far ABOVE the current Binance TWAP, so the shadow
+                // delta is strongly negative regardless of the real signal.
+                let with = evaluate_entry(
+                    &cfg(flag),
+                    &btc_twap_down(),
+                    &binance_up_trending(),
+                    &ms,
+                    &win,
+                    secs,
+                    Some(STRIKE),
+                    Some(99_000.0),
+                );
+
+                assert_eq!(
+                    without.rejection_reason, with.rejection_reason,
+                    "binance twap changed the rejection reason (flag={flag}, secs={secs})"
+                );
+                assert_eq!(
+                    without.side, with.side,
+                    "binance twap changed side selection (flag={flag}, secs={secs})"
+                );
+                assert_eq!(without.btc_delta_pct, with.btc_delta_pct);
+                assert_eq!(without.twap_delta_pct, with.twap_delta_pct);
+                assert_eq!(
+                    without.signal.is_some(),
+                    with.signal.is_some(),
+                    "binance twap changed whether a signal was produced"
+                );
+
+                // ...but it IS recorded when a strike is supplied.
+                assert_eq!(without.binance_twap_delta_pct, None);
+                let d = with.binance_twap_delta_pct.expect("shadow delta recorded");
+                assert!(d < 0.0, "expected negative shadow delta, got {d}");
+            }
+        }
+    }
+
     /// Guard: the fixture really does clear the trend gate, otherwise the two
     /// tests below would pass for the wrong reason.
     #[test]
@@ -399,6 +469,7 @@ mod strike_mode_tests {
             &win,
             60,
             Some(STRIKE),
+            None,
         );
         assert_eq!(r.rejection_reason, "rtds_mismatch");
     }
@@ -417,6 +488,7 @@ mod strike_mode_tests {
             &win,
             60,
             Some(STRIKE),
+            None,
         );
         assert_ne!(r.rejection_reason, "rtds_mismatch");
         // Empty book, so the next gate it reaches is the ask check.
@@ -482,6 +554,7 @@ mod strike_mode_tests {
             &win,
             60,
             Some(STRIKE),
+            None,
         );
         assert_eq!(before.rejection_reason, "market_resolved");
 
@@ -498,6 +571,7 @@ mod strike_mode_tests {
             &win,
             60,
             Some(STRIKE),
+            None,
         );
         assert_ne!(
             after.rejection_reason, "market_resolved",
@@ -526,6 +600,7 @@ mod strike_mode_tests {
             &win,
             60,
             Some(STRIKE),
+            None,
         );
         assert_eq!(r.rejection_reason, "below_threshold");
         assert_eq!(r.side.as_deref(), Some("Up"));

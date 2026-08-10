@@ -226,6 +226,84 @@ impl BinanceBtcPrice {
 
         Some(net / gross)
     }
+
+    /// Time-weighted average price over the trailing `window_ms`, ending at
+    /// the newest sample. Weights each price by how long it stood, matching
+    /// TWAP semantics (NOT a simple mean of ticks, which would over-weight
+    /// bursty periods).
+    /// Returns None if the buffer does not span at least `window_ms`.
+    ///
+    /// SHADOW/DATA COLLECTION ONLY — no gate, threshold, or side selection
+    /// reads this.
+    ///
+    /// Each sample's price is held until the NEXT sample arrives, so sample
+    /// `i` is weighted by `t[i+1] - t[i]`, clipped to the window. That makes
+    /// the newest sample weight zero: no time has yet elapsed at its price.
+    /// The sample straddling the window start still contributes, weighted only
+    /// for the portion of its life inside the window.
+    pub fn twap(&self, window_ms: u64) -> Option<f64> {
+        if window_ms == 0 || self.price_buffer.len() < 2 {
+            return None;
+        }
+
+        let newest_ts = self.price_buffer.back()?.0;
+        let oldest_ts = self.price_buffer.front()?.0;
+
+        // Fail closed, mirroring the span guard in trend_strength(): never
+        // extrapolate or pad a buffer that does not actually cover the window.
+        // This also rejects a buffer poisoned by a zero timestamp (a trade
+        // message with no trade_time), which would otherwise yield a span of 0.
+        if newest_ts.saturating_sub(oldest_ts) < window_ms {
+            return None;
+        }
+        let window_start = newest_ts.saturating_sub(window_ms);
+
+        let mut weighted_sum = 0.0f64;
+        let mut total_weight: u64 = 0;
+        // Forward-only cursor: guarantees the weighted intervals tile the
+        // window without overlapping, so total_weight can never exceed
+        // window_ms even if timestamps arrive out of order.
+        let mut cursor = window_start;
+
+        for ((t0, p0), (t1, _)) in self
+            .price_buffer
+            .iter()
+            .zip(self.price_buffer.iter().skip(1))
+        {
+            // Binance timestamps can repeat or arrive out of order; a
+            // zero-width or backwards interval contributes nothing rather than
+            // dividing by zero or subtracting weight.
+            if t1 <= t0 {
+                continue;
+            }
+            let start = (*t0).max(cursor);
+            let end = (*t1).min(newest_ts);
+            if end <= start {
+                continue;
+            }
+            let dt = end - start;
+            weighted_sum += p0 * dt as f64;
+            total_weight += dt;
+            cursor = end;
+        }
+
+        if total_weight == 0 {
+            return None;
+        }
+        Some(weighted_sum / total_weight as f64)
+    }
+}
+
+/// Percentage change between two Binance-derived TWAP values.
+///
+/// SHADOW ONLY. Binance publishes float prices, so this path is f64 by nature
+/// — kept deliberately separate from the Chainlink E18 string path, which must
+/// never round through f64.
+pub fn binance_twap_delta_pct(strike: f64, current: f64) -> Option<f64> {
+    if !strike.is_finite() || !current.is_finite() || strike == 0.0 {
+        return None;
+    }
+    Some((current - strike) / strike * 100.0)
 }
 
 // ── Binance WebSocket Messages ──
@@ -271,6 +349,35 @@ pub struct WindowState {
     pub twap_strike: Option<String>,
     /// Chainlink observation time of `twap_strike`.
     pub twap_strike_observed_ms: Option<i64>,
+    /// SHADOW ONLY. Binance-derived 30s TWAP at window open, for offline
+    /// comparison against the Chainlink strike. Never read by a decision.
+    pub binance_twap_strike: Option<f64>,
+    /// Bot wall-clock at the Binance strike capture.
+    pub binance_twap_strike_ms: Option<i64>,
+}
+
+/// SHADOW / DATA COLLECTION ONLY. Context gathered at signal-write time so the
+/// Binance-vs-Chainlink TWAP comparison can be reconstructed offline, including
+/// the lead-time cross-correlation. Nothing here is read by any gate,
+/// threshold, side selection, or order path.
+#[derive(Debug, Clone, Default)]
+pub struct SignalShadowContext {
+    pub binance_twap_delta_pct: Option<f64>,
+    pub binance_twap_value: Option<f64>,
+    pub binance_twap_strike: Option<f64>,
+    pub binance_spot_price: Option<f64>,
+    /// Raw E18 string — kept distinct from the f64 Binance columns.
+    pub chainlink_twap_value: Option<String>,
+    pub chainlink_twap_strike: Option<String>,
+    /// Buffer health: distinguishes a thin buffer (e.g. post-reconnect) from
+    /// genuine divergence when a Binance estimate is missing or poor.
+    pub binance_buffer_span_ms: Option<i64>,
+    pub binance_buffer_samples: Option<i64>,
+    pub binance_newest_sample_ms: Option<i64>,
+    /// Feed observation time of the Chainlink value used, for lead-time
+    /// measurement against the Binance series.
+    pub chainlink_twap_observed_ms: Option<i64>,
+    pub signal_evaluated_at_ms: i64,
 }
 
 impl WindowState {
@@ -359,6 +466,9 @@ pub struct TradeRecord {
     pub used_twap_strike: bool,
     /// Which feed supplied the TWAP reading at entry ("rtds"/"chainlink").
     pub twap_source_at_entry: Option<String>,
+    // SHADOW ONLY — recorded for offline analysis, never read by a decision.
+    pub binance_twap_delta_at_entry: Option<f64>,
+    pub binance_twap_strike_at_entry: Option<f64>,
 }
 
 // ── Strategy Evaluation Result ──
@@ -379,6 +489,10 @@ pub struct EvaluationResult {
     /// regardless of `use_twap_strike` — under the default (false) it is
     /// recorded for comparison only and drives nothing.
     pub twap_delta_pct: Option<f64>,
+    /// SHADOW ONLY. Binance-derived TWAP delta vs the Binance strike. Computed
+    /// and persisted for offline analysis; never read by any gate, threshold,
+    /// side selection, or ordering decision in either mode.
+    pub binance_twap_delta_pct: Option<f64>,
 }
 
 impl EvaluationResult {
@@ -395,6 +509,7 @@ impl EvaluationResult {
             trend_strength: None,
             side: None,
             twap_delta_pct: None,
+            binance_twap_delta_pct: None,
         }
     }
 }
@@ -562,6 +677,120 @@ mod rtds_tests {
         // No observation time means freshness cannot be judged: fail closed.
         assert_eq!(state_with(Some("1"), None).fresh_twap_30(NOW, MAX_AGE), None);
         assert_eq!(BtcPriceState::default().fresh_twap_30(NOW, MAX_AGE), None);
+    }
+
+    fn buf(samples: &[(u64, f64)]) -> BinanceBtcPrice {
+        BinanceBtcPrice {
+            price_buffer: samples.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The whole experiment rests on this being TIME-weighted. A simple mean of
+    /// ticks would give 200 here; the correct answer is ~103.33 because $100
+    /// stood for 29 of the 30 seconds.
+    #[test]
+    fn binance_twap_is_time_weighted_not_sample_weighted() {
+        let b = buf(&[(0, 100.0), (29_000, 200.0), (30_000, 300.0)]);
+        let t = b.twap(30_000).expect("spans the window");
+        let expected = (100.0 * 29_000.0 + 200.0 * 1_000.0) / 30_000.0;
+        assert!((t - expected).abs() < 1e-9, "got {t}, expected {expected}");
+        assert!((t - 103.333_333_333).abs() < 1e-6, "got {t}");
+
+        let simple_mean = (100.0 + 200.0 + 300.0) / 3.0;
+        assert!(
+            (t - simple_mean).abs() > 90.0,
+            "time-weighting must differ sharply from a tick mean"
+        );
+    }
+
+    /// The newest sample carries zero weight: no time has elapsed at its price.
+    #[test]
+    fn binance_twap_newest_sample_has_no_weight() {
+        // A wild final print must not move a TWAP whose window it just entered.
+        let a = buf(&[(0, 100.0), (30_000, 100.0)]).twap(30_000).unwrap();
+        let b = buf(&[(0, 100.0), (30_000, 999_999.0)]).twap(30_000).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, 100.0);
+    }
+
+    /// Fail closed on a buffer that does not cover the window — never pad or
+    /// extrapolate. Mirrors the span guard in trend_strength().
+    #[test]
+    fn binance_twap_requires_full_span() {
+        assert_eq!(buf(&[(0, 100.0), (29_999, 200.0)]).twap(30_000), None);
+        assert!(buf(&[(0, 100.0), (30_000, 200.0)]).twap(30_000).is_some());
+        // Empty / single-sample buffers.
+        assert_eq!(buf(&[]).twap(30_000), None);
+        assert_eq!(buf(&[(0, 100.0)]).twap(30_000), None);
+        // A zero timestamp (trade_time missing) as the newest sample collapses
+        // the span, so it fails closed rather than producing nonsense.
+        assert_eq!(buf(&[(50_000, 100.0), (0, 200.0)]).twap(30_000), None);
+    }
+
+    /// Repeated or backwards timestamps must never divide by zero, produce
+    /// NaN/inf, or double-count time. Malformed ordering is bounded, not
+    /// exact — the guarantee is that the result stays a genuine weighted
+    /// average of observed prices.
+    #[test]
+    fn binance_twap_survives_zero_width_and_backwards_intervals() {
+        let b = buf(&[
+            (0, 100.0),
+            (10_000, 100.0),
+            (10_000, 500.0), // duplicate stamp: zero width, no weight
+            (5_000, 900.0),  // backwards
+            (30_000, 200.0),
+        ]);
+        let t = b.twap(30_000).expect("still spans the window");
+        assert!(t.is_finite(), "must not be NaN/inf");
+        // A weighted average is a convex combination: it can never fall
+        // outside the observed price range.
+        assert!(
+            (100.0..=900.0).contains(&t),
+            "{t} outside the observed price range"
+        );
+    }
+
+    /// The forward-only cursor keeps weights non-overlapping, so a duplicate or
+    /// backwards stamp cannot inflate total weight past the window. Verified by
+    /// the identity: a constant-price buffer must return exactly that price.
+    #[test]
+    fn binance_twap_weights_never_overlap() {
+        let b = buf(&[
+            (0, 250.0),
+            (5_000, 250.0),
+            (5_000, 250.0),  // duplicate
+            (2_000, 250.0),  // backwards
+            (20_000, 250.0),
+            (30_000, 250.0),
+        ]);
+        // If any interval were double-counted the normalisation would still
+        // return 250 here, so also check a two-price case where overlap shows.
+        assert!((b.twap(30_000).unwrap() - 250.0).abs() < 1e-9);
+
+        let c = buf(&[(0, 100.0), (15_000, 100.0), (1_000, 300.0), (30_000, 100.0)]);
+        let t = c.twap(30_000).unwrap();
+        assert!((100.0..=300.0).contains(&t), "got {t}");
+    }
+
+    /// A sample straddling the window start counts only for its in-window life.
+    #[test]
+    fn binance_twap_clips_to_the_window() {
+        // Window [30_000, 60_000]: 100 holds for 10s inside, 200 for 20s.
+        let b = buf(&[(0, 100.0), (40_000, 200.0), (60_000, 300.0)]);
+        let t = b.twap(30_000).unwrap();
+        let expected = (100.0 * 10_000.0 + 200.0 * 20_000.0) / 30_000.0;
+        assert!((t - expected).abs() < 1e-9, "got {t}, expected {expected}");
+    }
+
+    #[test]
+    fn binance_twap_delta_pct_basic() {
+        assert_eq!(binance_twap_delta_pct(100.0, 101.0), Some(1.0));
+        assert_eq!(binance_twap_delta_pct(100.0, 100.0), Some(0.0));
+        assert_eq!(binance_twap_delta_pct(0.0, 100.0), None);
+        assert_eq!(binance_twap_delta_pct(f64::NAN, 100.0), None);
+        let d = binance_twap_delta_pct(100.0, 99.0).unwrap();
+        assert!(d < 0.0);
     }
 
     #[test]

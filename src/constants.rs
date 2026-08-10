@@ -32,6 +32,10 @@ pub const TWAP_RECONNECT_AFTER_MS: u64 = 120_000;
 /// How many recent windows the TWAP coverage counter tracks.
 pub const TWAP_COVERAGE_WINDOW: usize = 20;
 
+/// Lookback for the Binance-derived TWAP estimate, matched to Polymarket's
+/// 30s settlement TWAP for 5-minute markets.
+pub const BINANCE_TWAP_WINDOW_MS: u64 = 30_000;
+
 /// A TWAP reading observed slightly before the boundary is expected
 /// (the feed publishes on its own cadence). But a reading from well
 /// before the boundary belongs to the previous window.

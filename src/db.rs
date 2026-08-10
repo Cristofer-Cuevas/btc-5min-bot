@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, Result as SqlResult, Row};
 use std::sync::Mutex;
 use tracing::{error, info};
 
-use crate::types::{EvaluationResult, TradeRecord, TradingStats};
+use crate::types::{EvaluationResult, SignalShadowContext, TradeRecord, TradingStats};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -22,7 +22,8 @@ const TRADE_SELECT_COLS: &str = "\
     signal_detected_ms, order_sent_ms, order_ack_ms, \
     bot_version, neg_risk, \
     twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike, \
-    twap_source_at_entry";
+    twap_source_at_entry, \
+    binance_twap_delta_at_entry, binance_twap_strike_at_entry";
 
 /// True if `table` already has a column named `column`, per pragma table_info.
 /// Used to guard additive migrations so re-running init is a no-op instead of
@@ -98,6 +99,8 @@ fn read_trade_row(row: &Row) -> rusqlite::Result<TradeRecord> {
         // were produced by the spot model.
         used_twap_strike: row.get::<_, Option<i32>>(40)?.map(|v| v == 1).unwrap_or(false),
         twap_source_at_entry: row.get(41)?,
+        binance_twap_delta_at_entry: row.get(42)?,
+        binance_twap_strike_at_entry: row.get(43)?,
     })
 }
 
@@ -288,6 +291,43 @@ impl Database {
             }
         }
 
+        // Binance-derived TWAP shadow dataset. Same pragma-guarded additive
+        // approach: NULL defaults, idempotent, nothing dropped or recreated.
+        // Binance values are REAL (the feed publishes floats); Chainlink values
+        // stay TEXT holding raw E18, so the two representations never share a
+        // column.
+        let binance_twap_cols: [(&str, &str, &str); 17] = [
+            ("signals", "binance_twap_delta_pct", "REAL"),
+            ("signals", "binance_twap_value", "REAL"),
+            ("signals", "binance_twap_strike", "REAL"),
+            ("signals", "binance_spot_price", "REAL"),
+            ("signals", "chainlink_twap_value", "TEXT"),
+            ("signals", "chainlink_twap_strike", "TEXT"),
+            ("signals", "binance_buffer_span_ms", "INTEGER"),
+            ("signals", "binance_buffer_samples", "INTEGER"),
+            // Lead-time measurement (Part 5).
+            ("signals", "chainlink_twap_observed_ms", "INTEGER"),
+            ("signals", "signal_evaluated_at_ms", "INTEGER"),
+            ("signals", "binance_newest_sample_ms", "INTEGER"),
+            // Per-window comparison against the settled outcome.
+            ("twap_observations", "binance_twap_at_open", "REAL"),
+            ("twap_observations", "binance_twap_at_resolve", "REAL"),
+            ("twap_observations", "binance_twap_open_ms", "INTEGER"),
+            ("twap_observations", "binance_twap_resolve_ms", "INTEGER"),
+            // Appended at the END of trades so no existing positional index in
+            // TRADE_SELECT_COLS / read_trade_row shifts.
+            ("trades", "binance_twap_delta_at_entry", "REAL"),
+            ("trades", "binance_twap_strike_at_entry", "REAL"),
+        ];
+        for (table, name, ty) in &binance_twap_cols {
+            if !column_exists(&conn, table, name) {
+                let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, name, ty);
+                if let Err(e) = conn.execute(&sql, []) {
+                    error!("Failed to add {}.{}: {}", table, name, e);
+                }
+            }
+        }
+
         // TWAP observation columns, added with an explicit pragma guard so a
         // pre-existing twap_observations table (from an earlier build) is
         // widened in place rather than dropped/recreated. Additive and
@@ -336,6 +376,9 @@ impl Database {
     /// `twap_observed_ms` is the FEED's Chainlink observation time;
     /// `captured_at_ms` is the bot's wall-clock at capture. They answer
     /// different questions and are stored separately.
+    // Wide by nature: one parameter per recorded column. Grouping them into a
+    // struct would add indirection without removing the fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_twap_at_open(
         &self,
         window_ts: i64,
@@ -344,20 +387,24 @@ impl Database {
         snapshot_price: Option<f64>,
         captured_at_ms: i64,
         source: Option<&str>,
+        binance_twap: Option<f64>,
     ) {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = conn.execute(
             "INSERT INTO twap_observations (
                 window_ts, twap_30_at_open, twap_30_at_open_ms,
-                snapshot_price_at_open, open_captured_at_ms, twap_source, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                snapshot_price_at_open, open_captured_at_ms, twap_source,
+                binance_twap_at_open, binance_twap_open_ms, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(window_ts) DO UPDATE SET
                 twap_30_at_open = excluded.twap_30_at_open,
                 twap_30_at_open_ms = excluded.twap_30_at_open_ms,
                 snapshot_price_at_open = excluded.snapshot_price_at_open,
                 open_captured_at_ms = excluded.open_captured_at_ms,
                 twap_source = COALESCE(excluded.twap_source, twap_observations.twap_source),
+                binance_twap_at_open = excluded.binance_twap_at_open,
+                binance_twap_open_ms = excluded.binance_twap_open_ms,
                 updated_at = excluded.updated_at",
             params![
                 window_ts,
@@ -366,6 +413,8 @@ impl Database {
                 snapshot_price,
                 captured_at_ms,
                 source,
+                binance_twap,
+                captured_at_ms,
                 now
             ],
         ) {
@@ -480,6 +529,7 @@ impl Database {
     /// Record the TWAP/snapshot close, captured at the WINDOW BOUNDARY
     /// (window_ts + WINDOW_SECS) rather than on the market_resolved event,
     /// which arrives late and with variable delay.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_twap_at_resolve(
         &self,
         window_ts: i64,
@@ -488,20 +538,24 @@ impl Database {
         snapshot_price: Option<f64>,
         captured_at_ms: i64,
         source: Option<&str>,
+        binance_twap: Option<f64>,
     ) {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = conn.execute(
             "INSERT INTO twap_observations (
                 window_ts, twap_30_at_resolve, twap_30_at_resolve_ms,
-                snapshot_price_at_resolve, resolve_captured_at_ms, twap_source, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                snapshot_price_at_resolve, resolve_captured_at_ms, twap_source,
+                binance_twap_at_resolve, binance_twap_resolve_ms, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(window_ts) DO UPDATE SET
                 twap_30_at_resolve = excluded.twap_30_at_resolve,
                 twap_30_at_resolve_ms = excluded.twap_30_at_resolve_ms,
                 snapshot_price_at_resolve = excluded.snapshot_price_at_resolve,
                 resolve_captured_at_ms = excluded.resolve_captured_at_ms,
                 twap_source = COALESCE(excluded.twap_source, twap_observations.twap_source),
+                binance_twap_at_resolve = excluded.binance_twap_at_resolve,
+                binance_twap_resolve_ms = excluded.binance_twap_resolve_ms,
                 updated_at = excluded.updated_at",
             params![
                 window_ts,
@@ -510,6 +564,8 @@ impl Database {
                 snapshot_price,
                 captured_at_ms,
                 source,
+                binance_twap,
+                captured_at_ms,
                 now
             ],
         ) {
@@ -533,7 +589,8 @@ impl Database {
                 signal_detected_ms, order_sent_ms, order_ack_ms,
                 bot_version, neg_risk,
                 twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike,
-                twap_source_at_entry
+                twap_source_at_entry,
+                binance_twap_delta_at_entry, binance_twap_strike_at_entry
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10, ?11,
@@ -547,7 +604,8 @@ impl Database {
                 ?29, ?30, ?31,
                 ?32, ?33,
                 ?34, ?35, ?36,
-                ?37
+                ?37,
+                ?38, ?39
              )",
             params![
                 trade.timestamp,
@@ -587,17 +645,24 @@ impl Database {
                 trade.twap_strike_at_entry,
                 trade.used_twap_strike as i32,
                 trade.twap_source_at_entry,
+                trade.binance_twap_delta_at_entry,
+                trade.binance_twap_strike_at_entry,
             ],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
+    /// `ctx` carries SHADOW-ONLY observability fields (Binance TWAP estimate,
+    /// paired Chainlink values, buffer health, lead-time timestamps). Written
+    /// on every signal, including rejections — rejections are the larger sample
+    /// and where most of the comparison value lives.
     pub fn insert_signal(
         &self,
         eval: &EvaluationResult,
         window_ts: i64,
         secs_left: i64,
         dry_run: bool,
+        ctx: &SignalShadowContext,
     ) {
         let conn = self.conn.lock().unwrap();
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -606,8 +671,14 @@ impl Database {
                 timestamp_ms, window_ts, secs_left, btc_delta_pct,
                 ask_price, bid_price, spread, ask_depth, trade_count,
                 trend_strength, side, rejection_reason, dry_run,
-                twap_delta_pct
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                twap_delta_pct,
+                binance_twap_delta_pct, binance_twap_value, binance_twap_strike,
+                binance_spot_price, chainlink_twap_value, chainlink_twap_strike,
+                binance_buffer_span_ms, binance_buffer_samples,
+                chainlink_twap_observed_ms, signal_evaluated_at_ms,
+                binance_newest_sample_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 now_ms,
                 window_ts,
@@ -623,6 +694,19 @@ impl Database {
                 eval.rejection_reason,
                 dry_run as i32,
                 eval.twap_delta_pct,
+                // Prefer the value the evaluation itself produced; fall back to
+                // the context for rejections raised before evaluate_entry ran.
+                eval.binance_twap_delta_pct.or(ctx.binance_twap_delta_pct),
+                ctx.binance_twap_value,
+                ctx.binance_twap_strike,
+                ctx.binance_spot_price,
+                ctx.chainlink_twap_value,
+                ctx.chainlink_twap_strike,
+                ctx.binance_buffer_span_ms,
+                ctx.binance_buffer_samples,
+                ctx.chainlink_twap_observed_ms,
+                ctx.signal_evaluated_at_ms,
+                ctx.binance_newest_sample_ms,
             ],
         ) {
             error!("Failed to insert signal: {}", e);
