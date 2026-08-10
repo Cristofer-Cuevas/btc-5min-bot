@@ -256,12 +256,16 @@ async fn build_status(
 
     let secs_left = crate::discovery::secs_remaining();
 
-    // Health of the TWAP feed dependency over recent windows.
-    let (twap_fresh, twap_samples) = ws.twap_coverage();
+    // Health of the TWAP feed dependency over recent windows, broken down by
+    // source so it is visible how much coverage leans on the fallback.
+    let (twap_fresh, twap_samples, twap_rtds, twap_chainlink) = ws.twap_coverage();
     let coverage_str = if twap_samples == 0 {
         "no samples yet".to_string()
     } else {
-        format!("{}/{}", twap_fresh, twap_samples)
+        format!(
+            "{}/{} (rtds {}, chainlink {})",
+            twap_fresh, twap_samples, twap_rtds, twap_chainlink
+        )
     };
 
     format!(

@@ -47,10 +47,11 @@ async fn fresh_twap_for_capture(
     btc_price: &SharedBtcPrice,
     now_ms: i64,
     capture_point: &str,
-) -> Option<(String, i64)> {
+) -> Option<(String, i64, Option<TwapSource>)> {
     let btc = btc_price.read().await;
-    if let Some(fresh) = btc.fresh_twap_30(now_ms, TWAP_MAX_AGE_MS) {
-        return Some(fresh);
+    if let Some((value, observed)) = btc.fresh_twap_30(now_ms, TWAP_MAX_AGE_MS) {
+        // Source read under the same guard as the value it describes.
+        return Some((value, observed, btc.twap_30_source));
     }
     match btc.twap_30_observed_at_ms {
         Some(obs) => {
@@ -264,20 +265,23 @@ async fn main() {
                 let fresh = fresh_twap_for_capture(&btc_price, now_ms, "resolve").await;
                 let snapshot_close = btc_price.read().await.current_price;
 
+                let close_source = fresh.as_ref().and_then(|(_, _, s)| *s);
+
                 db.record_twap_at_resolve(
                     closing_ts,
-                    fresh.as_ref().map(|(v, _)| v.as_str()),
-                    fresh.as_ref().map(|(_, obs)| *obs),
+                    fresh.as_ref().map(|(v, _, _)| v.as_str()),
+                    fresh.as_ref().map(|(_, obs, _)| *obs),
                     snapshot_close,
                     now_ms,
+                    close_source.map(|s| s.as_str()),
                 );
 
                 {
                     let mut ws = window_state.write().await;
                     ws.resolve_captured = true;
-                    // Coverage health: did this window's close capture actually
-                    // land a fresh reading?
-                    ws.push_twap_coverage(fresh.is_some());
+                    // Coverage health: did this window's close capture land a
+                    // fresh reading, and from which feed?
+                    ws.push_twap_coverage(if fresh.is_some() { close_source } else { None });
                 }
 
                 info!(
@@ -291,7 +295,7 @@ async fn main() {
                         .unwrap_or_else(|| "N/A".into()),
                     fresh
                         .as_ref()
-                        .and_then(|(v, _)| format_e18(v))
+                        .and_then(|(v, _, _)| format_e18(v))
                         .unwrap_or_else(|| "N/A".into()),
                 );
             }
@@ -404,23 +408,65 @@ async fn main() {
         if !window_state.read().await.open_captured && now_secs >= current_ts as i64 {
             let fresh = fresh_twap_for_capture(&btc_price, now_ms, "open").await;
             let snapshot_open = btc_price.read().await.current_price;
+            let boundary_ms = current_ts as i64 * 1000;
 
+            // The observation record keeps whatever was seen, so the collected
+            // dataset stays complete and skew can be recomputed in SQL from
+            // twap_30_at_open_ms.
             db.record_twap_at_open(
                 current_ts as i64,
-                fresh.as_ref().map(|(v, _)| v.as_str()),
-                fresh.as_ref().map(|(_, obs)| *obs),
+                fresh.as_ref().map(|(v, _, _)| v.as_str()),
+                fresh.as_ref().map(|(_, obs, _)| *obs),
                 snapshot_open,
                 now_ms,
+                fresh.as_ref().and_then(|(_, _, s)| *s).map(|s| s.as_str()),
             );
+
+            // Boundary invariant for the STRIKE specifically. The feed
+            // publishes on its own cadence, so an observation slightly before
+            // the boundary still reflects the transition — but one from well
+            // before it belongs to the PREVIOUS window, and using it would be
+            // indistinguishable from a bad prediction in the data.
+            let strike = match fresh.as_ref() {
+                Some((value, observed, source)) => {
+                    let skew_ms = *observed - boundary_ms;
+                    if *observed < boundary_ms - TWAP_STRIKE_LOOKBACK_TOLERANCE_MS {
+                        warn!(
+                            "Strike REJECTED (pre-boundary): window={} feed_observed_ms={} \
+                             boundary_ms={} skew_ms={} exceeds tolerance -{}ms; storing None",
+                            current_ts,
+                            observed,
+                            boundary_ms,
+                            skew_ms,
+                            TWAP_STRIKE_LOOKBACK_TOLERANCE_MS
+                        );
+                        None
+                    } else {
+                        info!(
+                            "Strike captured: window={} boundary_ms={} captured_at_ms={} \
+                             feed_observed_ms={} skew_ms={} value={} source={}",
+                            current_ts,
+                            boundary_ms,
+                            now_ms,
+                            observed,
+                            skew_ms,
+                            format_e18(value).unwrap_or_else(|| value.clone()),
+                            source.map(|s| s.as_str()).unwrap_or("unknown"),
+                        );
+                        Some((value.clone(), *observed))
+                    }
+                }
+                None => None,
+            };
 
             {
                 let mut ws = window_state.write().await;
                 ws.open_captured = true;
                 // The strike: TWAP at window open. None when the reading was
-                // stale — never backfilled, so a stale feed yields no strike
-                // and (under USE_TWAP_STRIKE=true) no entry.
-                ws.twap_strike = fresh.as_ref().map(|(v, _)| v.clone());
-                ws.twap_strike_observed_ms = fresh.as_ref().map(|(_, obs)| *obs);
+                // stale or pre-boundary — never backfilled, so a bad reading
+                // yields no strike and (under USE_TWAP_STRIKE=true) no entry.
+                ws.twap_strike = strike.as_ref().map(|(v, _)| v.clone());
+                ws.twap_strike_observed_ms = strike.as_ref().map(|(_, obs)| *obs);
             }
 
             info!(
@@ -428,13 +474,13 @@ async fn main() {
                  (boundary={}) snapshot_open={} twap_open={}",
                 current_ts,
                 now_ms,
-                current_ts as i64 * 1000,
+                boundary_ms,
                 snapshot_open
                     .map(|p| format!("{:.2}", p))
                     .unwrap_or_else(|| "N/A".into()),
                 fresh
                     .as_ref()
-                    .and_then(|(v, _)| format_e18(v))
+                    .and_then(|(v, _, _)| format_e18(v))
                     .unwrap_or_else(|| "N/A".into()),
             );
         }
@@ -861,6 +907,10 @@ async fn main() {
                 twap_delta_pct_at_entry: eval_result.twap_delta_pct,
                 twap_strike_at_entry: twap_strike_entry,
                 used_twap_strike: use_twap_strike_flag,
+                twap_source_at_entry: twap_entry
+                    .as_ref()
+                    .and_then(|(_, _, s)| *s)
+                    .map(|s| s.as_str().to_string()),
             };
 
             if let Err(e) = db.insert_trade(&trade) {
@@ -871,8 +921,8 @@ async fn main() {
             // placed. NULL if the feed had not produced a reading yet.
             db.record_twap_at_entry(
                 current_ts as i64,
-                twap_entry.as_ref().map(|(v, _)| v.as_str()),
-                twap_entry.as_ref().map(|(_, obs)| *obs),
+                twap_entry.as_ref().map(|(v, _, _)| v.as_str()),
+                twap_entry.as_ref().map(|(_, obs, _)| *obs),
                 &signal.side,
             );
 

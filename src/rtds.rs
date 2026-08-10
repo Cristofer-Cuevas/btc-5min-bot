@@ -3,7 +3,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::constants::{TWAP_RECONNECT_AFTER_MS, TWAP_RESUBSCRIBE_AFTER_MS};
-use crate::types::{format_e18, RtdsMessage, RtdsSubscribe, RtdsSubscription, SharedBtcPrice};
+use crate::types::{
+    format_e18, RtdsMessage, RtdsSubscribe, RtdsSubscription, SharedBtcPrice, TwapSource,
+};
 
 const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 const PING_INTERVAL_SECS: u64 = 5;
@@ -329,6 +331,7 @@ async fn handle_twap_update(
         state.twap_30_value = Some(exact.to_string());
         state.twap_30_observed_at_ms = observed_ms;
         state.twap_30_display_value = payload.value;
+        state.twap_30_source = Some(TwapSource::Rtds);
     }
 
     if !*twap_seen {
@@ -377,4 +380,76 @@ fn report_twap_subscription_error(text: &str) -> bool {
         excerpt
     );
     true
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+    use crate::types::BtcPriceState;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn state() -> SharedBtcPrice {
+        Arc::new(RwLock::new(BtcPriceState::default()))
+    }
+
+    async fn feed(raw: &str) -> (bool, bool) {
+        let s = state();
+        let mut seen = false;
+        let o = handle_rtds_message(raw, &s, &mut seen).await;
+        (o.twap_update, o.twap_rejected)
+    }
+
+    /// Item 4a: only a parsed, correct-symbol, value-bearing TWAP payload counts
+    /// as the feed being alive. Everything else must leave the silence timer
+    /// running, or a socket that is "up but mute" looks healthy forever.
+    #[tokio::test]
+    async fn only_usable_twap_payload_signals_liveness() {
+        let good = r#"{"topic":"crypto_prices_twap_thirty","payload":{"symbol":"btc/usd",
+            "value":65000.5,"full_accuracy_value":"65000500000000000000000",
+            "timestamp":1785178800000,"window_s":30}}"#;
+        assert!(feed(good).await.0, "valid TWAP must reset the timer");
+
+        // Wrong symbol.
+        let eth = r#"{"topic":"crypto_prices_twap_thirty","payload":{"symbol":"eth/usd",
+            "full_accuracy_value":"3000000000000000000000","timestamp":1785178800000}}"#;
+        assert!(!feed(eth).await.0, "off-symbol must NOT reset");
+
+        // Missing the exact value.
+        let novalue = r#"{"topic":"crypto_prices_twap_thirty","payload":{"symbol":"btc/usd",
+            "value":65000.5,"timestamp":1785178800000}}"#;
+        assert!(!feed(novalue).await.0, "no exact value must NOT reset");
+
+        // Empty payload, unparseable frame, and the SPOT feed all must not count.
+        let nopayload = r#"{"topic":"crypto_prices_twap_thirty"}"#;
+        assert!(!feed(nopayload).await.0);
+        assert!(!feed("not json at all").await.0);
+        let spot = r#"{"topic":"crypto_prices_chainlink","payload":{"symbol":"btc/usd",
+            "value":65000.5,"timestamp":1785178800000}}"#;
+        assert!(!feed(spot).await.0, "spot traffic must NOT mask TWAP silence");
+    }
+
+    /// A rejection is surfaced so the caller can force a full reconnect.
+    #[tokio::test]
+    async fn subscription_rejection_is_detected() {
+        let rej = r#"{"error":"topic not found: crypto_prices_twap_thirty"}"#;
+        assert!(feed(rej).await.1);
+        // A normal spot frame is not a rejection.
+        let spot = r#"{"topic":"crypto_prices_chainlink","payload":{"symbol":"btc/usd","value":1.0}}"#;
+        assert!(!feed(spot).await.1);
+    }
+
+    /// A usable reading is tagged with its source.
+    #[tokio::test]
+    async fn twap_reading_is_tagged_rtds() {
+        let s = state();
+        let mut seen = false;
+        let raw = r#"{"topic":"crypto_prices_twap_thirty","payload":{"symbol":"btc/usd",
+            "value":65000.5,"full_accuracy_value":"65000500000000000000000",
+            "timestamp":1785178800000,"window_s":30}}"#;
+        handle_rtds_message(raw, &s, &mut seen).await;
+        let st = s.read().await;
+        assert_eq!(st.twap_30_source, Some(TwapSource::Rtds));
+        assert_eq!(st.twap_30_value.as_deref(), Some("65000500000000000000000"));
+    }
 }

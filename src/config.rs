@@ -43,6 +43,23 @@ pub struct RuntimeConfig {
     /// With it false the bot runs in shadow mode — the TWAP delta is computed
     /// and logged, but the spot delta still drives every decision.
     pub use_twap_strike: bool,
+
+    // ── Chainlink Data Streams fallback ──
+    // NOTE: the fetch/decode path is NOT implemented — the v2 report schema
+    // used by the TWAP streams is not published in Chainlink's official docs
+    // (see report notes). These fields carry the credentials so the path can be
+    // added without a config change once the schema is confirmed.
+    // Unread until the fetch/decode path lands; kept so enabling the fallback
+    // is a config change only, not a schema change.
+    #[allow(dead_code)]
+    pub chainlink_api_key: String,
+    #[allow(dead_code)]
+    pub chainlink_api_secret: String,
+    #[allow(dead_code)]
+    pub chainlink_stream_id: String,
+    /// Defaults to FALSE. Enabling it currently only logs an error — see above.
+    #[allow(dead_code)]
+    pub use_chainlink_fallback: bool,
 }
 
 impl RuntimeConfig {
@@ -160,6 +177,24 @@ impl RuntimeConfig {
             ));
         }
 
+        let chainlink_api_key = env::var("CHAINLINK_API_KEY").unwrap_or_default();
+        let chainlink_api_secret = env::var("CHAINLINK_API_SECRET").unwrap_or_default();
+        let chainlink_stream_id = env::var("CHAINLINK_STREAM_ID").unwrap_or_default();
+        let use_chainlink_fallback = env::var("USE_CHAINLINK_FALLBACK")
+            .unwrap_or_else(|_| "false".into())
+            .to_lowercase()
+            == "true";
+        if use_chainlink_fallback {
+            // Fail loudly rather than silently no-op: the fetch/decode path is
+            // not implemented because the v2 report schema for the TWAP streams
+            // is not published in Chainlink's official documentation.
+            tracing::error!(
+                "USE_CHAINLINK_FALLBACK=true but the Chainlink Data Streams fallback is NOT \
+                 IMPLEMENTED (v2 report schema unconfirmed). RTDS remains the only TWAP source \
+                 and no fallback fetch will occur."
+            );
+        }
+
         Ok(Self {
             poly_private_key,
             poly_address,
@@ -180,6 +215,10 @@ impl RuntimeConfig {
             db_path,
             dry_run,
             use_twap_strike,
+            chainlink_api_key,
+            chainlink_api_secret,
+            chainlink_stream_id,
+            use_chainlink_fallback,
         })
     }
 

@@ -32,5 +32,10 @@ pub const TWAP_RECONNECT_AFTER_MS: u64 = 120_000;
 /// How many recent windows the TWAP coverage counter tracks.
 pub const TWAP_COVERAGE_WINDOW: usize = 20;
 
+/// A TWAP reading observed slightly before the boundary is expected
+/// (the feed publishes on its own cadence). But a reading from well
+/// before the boundary belongs to the previous window.
+pub const TWAP_STRIKE_LOOKBACK_TOLERANCE_MS: i64 = 30_000;
+
 /// Length of a trading window in seconds.
 pub const WINDOW_SECS: i64 = 300;

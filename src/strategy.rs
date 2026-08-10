@@ -90,31 +90,37 @@ pub fn evaluate_entry(
         }
     }
 
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let rtds_stale =
-        btc.last_update_ms == 0 || now_ms.saturating_sub(btc.last_update_ms) > RTDS_STALE_MS;
+    // The RTDS mismatch gate cross-checks Binance spot against RTDS spot.
+    // In TWAP mode the decision comes from the Chainlink TWAP delta, so this
+    // gate validates feeds that are not driving the trade. RTDS spot and the
+    // TWAP feed are both Chainlink-sourced, making the check near-redundant.
+    if !config.use_twap_strike {
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let rtds_stale =
+            btc.last_update_ms == 0 || now_ms.saturating_sub(btc.last_update_ms) > RTDS_STALE_MS;
 
-    if !rtds_stale {
-        match (btc.current_price, btc.window_open_price) {
-            (Some(rtds_current), Some(rtds_open)) => {
-                let rtds_delta = rtds_current - rtds_open;
-                let same_direction = (delta_pct > 0.0 && rtds_delta > 0.0)
-                    || (delta_pct < 0.0 && rtds_delta < 0.0);
-                if !same_direction {
-                    info!(
-                        "RTDS direction mismatch: binance Δ={:+.4}% rtds Δ=${:+.2}",
-                        delta_pct, rtds_delta
-                    );
-                    r.rejection_reason = "rtds_mismatch";
-                    return r;
+        if !rtds_stale {
+            match (btc.current_price, btc.window_open_price) {
+                (Some(rtds_current), Some(rtds_open)) => {
+                    let rtds_delta = rtds_current - rtds_open;
+                    let same_direction = (delta_pct > 0.0 && rtds_delta > 0.0)
+                        || (delta_pct < 0.0 && rtds_delta < 0.0);
+                    if !same_direction {
+                        info!(
+                            "RTDS direction mismatch: binance Δ={:+.4}% rtds Δ=${:+.2}",
+                            delta_pct, rtds_delta
+                        );
+                        r.rejection_reason = "rtds_mismatch";
+                        return r;
+                    }
+                }
+                _ => {
+                    info!("RTDS prices not yet available, using Binance alone");
                 }
             }
-            _ => {
-                info!("RTDS prices not yet available, using Binance alone");
-            }
+        } else {
+            info!("RTDS stale (>{}ms), using Binance alone", RTDS_STALE_MS);
         }
-    } else {
-        info!("RTDS stale (>{}ms), using Binance alone", RTDS_STALE_MS);
     }
 
     let (side, token_id, book) = if decision_delta > 0.0 {
@@ -235,6 +241,10 @@ mod strike_mode_tests {
             db_path: ":memory:".into(),
             dry_run: true,
             use_twap_strike,
+            chainlink_api_key: String::new(),
+            chainlink_api_secret: String::new(),
+            chainlink_stream_id: String::new(),
+            use_chainlink_fallback: false,
         }
     }
 
@@ -331,6 +341,86 @@ mod strike_mode_tests {
         let r = evaluate_entry(&cfg(true), &stale, &binance_up(), &ms, &win, 60, Some(STRIKE));
         assert_eq!(r.rejection_reason, "twap_unavailable");
         assert_eq!(r.twap_delta_pct, None);
+    }
+
+    /// RTDS spot state that disagrees in direction with `binance_up()`:
+    /// binance says +0.20%, RTDS spot says down. Fresh, so the gate applies.
+    fn btc_rtds_disagrees() -> BtcPriceState {
+        BtcPriceState {
+            current_price: Some(64_900.0),
+            window_open_price: Some(65_000.0),
+            last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
+            twap_30_value: Some("64800000000000000000000".into()),
+            twap_30_observed_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            ..Default::default()
+        }
+    }
+
+    /// Same +0.20% move as `binance_up()`, but with a buffer that clears the
+    /// trend-strength gate so evaluation actually reaches the RTDS gate.
+    /// Monotonic prices over 120s give net/gross = 1.0.
+    fn binance_up_trending() -> BinanceBtcPrice {
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let n = crate::constants::MIN_TREND_SAMPLES + 20;
+        let buffer = (0..n)
+            .map(|i| {
+                let frac = i as f64 / (n - 1) as f64;
+                (
+                    now - 120_000 + (frac * 120_000.0) as u64,
+                    65_000.0 + frac * 130.0,
+                )
+            })
+            .collect();
+        BinanceBtcPrice {
+            current_price: Some(65_130.0),
+            window_open_price: Some(65_000.0),
+            last_update_ms: now,
+            price_buffer: buffer,
+        }
+    }
+
+    /// Guard: the fixture really does clear the trend gate, otherwise the two
+    /// tests below would pass for the wrong reason.
+    #[test]
+    fn trending_fixture_clears_trend_gate() {
+        let s = binance_up_trending().trend_strength();
+        assert!(s.is_some() && s.unwrap() >= 0.41, "trend_strength = {:?}", s);
+    }
+
+    /// Item 3: the gate must still fire in non-TWAP mode.
+    #[test]
+    fn rtds_mismatch_gate_still_fires_in_spot_mode() {
+        let (ms, win) = market();
+        let r = evaluate_entry(
+            &cfg(false),
+            &btc_rtds_disagrees(),
+            &binance_up_trending(),
+            &ms,
+            &win,
+            60,
+            Some(STRIKE),
+        );
+        assert_eq!(r.rejection_reason, "rtds_mismatch");
+    }
+
+    /// Item 3: the same inputs must NOT hit the gate in TWAP mode, because the
+    /// gate cross-checks feeds that are not driving the decision. Evaluation
+    /// continues to the next unchanged gate instead.
+    #[test]
+    fn rtds_mismatch_gate_skipped_in_twap_mode() {
+        let (ms, win) = market();
+        let r = evaluate_entry(
+            &cfg(true),
+            &btc_rtds_disagrees(),
+            &binance_up_trending(),
+            &ms,
+            &win,
+            60,
+            Some(STRIKE),
+        );
+        assert_ne!(r.rejection_reason, "rtds_mismatch");
+        // Empty book, so the next gate it reaches is the ask check.
+        assert_eq!(r.rejection_reason, "no_ask");
     }
 
     /// Below-threshold behavior is still governed by the spot delta in shadow

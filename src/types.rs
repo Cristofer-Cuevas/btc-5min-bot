@@ -57,6 +57,27 @@ pub struct MarketState {
     pub down_trade_count: u32,
 }
 
+// ── TWAP Source ──
+
+/// Which feed produced a TWAP reading. Recorded alongside every stored value so
+/// it is always possible to tell which source fed a given decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwapSource {
+    /// Polymarket RTDS relay of the Chainlink TWAP (primary).
+    Rtds,
+    /// Chainlink Data Streams direct (fallback).
+    Chainlink,
+}
+
+impl TwapSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TwapSource::Rtds => "rtds",
+            TwapSource::Chainlink => "chainlink",
+        }
+    }
+}
+
 // ── BTC Price State ──
 
 #[derive(Debug, Clone, Default)]
@@ -82,6 +103,8 @@ pub struct BtcPriceState {
     /// `payload.value`, the feed's display-only float. Diagnostics and logging
     /// only — never persisted to a settlement column.
     pub twap_30_display_value: Option<f64>,
+    /// Which feed produced `twap_30_value`.
+    pub twap_30_source: Option<TwapSource>,
 }
 
 impl BtcPriceState {
@@ -216,12 +239,13 @@ pub struct WindowState {
     /// DATA COLLECTION ONLY. Set once the outgoing window's boundary capture
     /// has run (at or after `window_ts + WINDOW_SECS`); cleared on rotation.
     pub resolve_captured: bool,
-    /// Rolling record of whether the last N windows had a FRESH TWAP at the
-    /// resolve capture point, newest at the back. Health metric for the feed
+    /// Rolling record of the last N windows' resolve captures, newest at the
+    /// back: `Some(source)` when a FRESH reading was found and which feed it
+    /// came from, `None` when the window was dark. Health metric for the feed
     /// dependency, surfaced via Telegram /status.
     ///
     /// Deliberately NOT cleared on rotation — it spans windows by design.
-    pub twap_coverage_recent: VecDeque<bool>,
+    pub twap_coverage_recent: VecDeque<Option<TwapSource>>,
     /// The window's strike: the TWAP at window open, as the raw E18 string.
     /// `None` when the open capture found no fresh reading — never backfilled.
     /// Cleared on rotation.
@@ -231,21 +255,33 @@ pub struct WindowState {
 }
 
 impl WindowState {
-    /// Record whether this window's resolve capture found a fresh TWAP,
-    /// evicting the oldest sample beyond `TWAP_COVERAGE_WINDOW`.
-    pub fn push_twap_coverage(&mut self, fresh: bool) {
-        self.twap_coverage_recent.push_back(fresh);
+    /// Record this window's resolve capture — `Some(source)` if a fresh reading
+    /// was found — evicting the oldest sample beyond `TWAP_COVERAGE_WINDOW`.
+    pub fn push_twap_coverage(&mut self, source: Option<TwapSource>) {
+        self.twap_coverage_recent.push_back(source);
         while self.twap_coverage_recent.len() > crate::constants::TWAP_COVERAGE_WINDOW {
             self.twap_coverage_recent.pop_front();
         }
     }
 
-    /// (fresh_count, sample_count) over the tracked windows.
-    pub fn twap_coverage(&self) -> (usize, usize) {
-        (
-            self.twap_coverage_recent.iter().filter(|f| **f).count(),
-            self.twap_coverage_recent.len(),
-        )
+    /// (fresh_count, sample_count, rtds_count, chainlink_count) over the
+    /// tracked windows, so /status can show how much coverage depends on the
+    /// fallback rather than the primary feed.
+    pub fn twap_coverage(&self) -> (usize, usize, usize, usize) {
+        let fresh = self.twap_coverage_recent.iter().flatten().count();
+        let rtds = self
+            .twap_coverage_recent
+            .iter()
+            .flatten()
+            .filter(|s| **s == TwapSource::Rtds)
+            .count();
+        let chainlink = self
+            .twap_coverage_recent
+            .iter()
+            .flatten()
+            .filter(|s| **s == TwapSource::Chainlink)
+            .count();
+        (fresh, self.twap_coverage_recent.len(), rtds, chainlink)
     }
 }
 
@@ -302,6 +338,8 @@ pub struct TradeRecord {
     /// Which model produced this trade: true = TWAP delta drove the threshold
     /// and side, false = Binance spot delta did.
     pub used_twap_strike: bool,
+    /// Which feed supplied the TWAP reading at entry ("rtds"/"chainlink").
+    pub twap_source_at_entry: Option<String>,
 }
 
 // ── Strategy Evaluation Result ──

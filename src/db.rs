@@ -21,7 +21,8 @@ const TRADE_SELECT_COLS: &str = "\
     limit_price, fill_price, fill_attempts, \
     signal_detected_ms, order_sent_ms, order_ack_ms, \
     bot_version, neg_risk, \
-    twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike";
+    twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike, \
+    twap_source_at_entry";
 
 /// True if `table` already has a column named `column`, per pragma table_info.
 /// Used to guard additive migrations so re-running init is a no-op instead of
@@ -96,6 +97,7 @@ fn read_trade_row(row: &Row) -> rusqlite::Result<TradeRecord> {
         // NULL on the 144 pre-migration rows: those all predate the flag and
         // were produced by the spot model.
         used_twap_strike: row.get::<_, Option<i32>>(40)?.map(|v| v == 1).unwrap_or(false),
+        twap_source_at_entry: row.get(41)?,
     })
 }
 
@@ -268,13 +270,14 @@ impl Database {
         // defaults — live history in both tables is preserved untouched.
         // Appended at the END of `trades` so no existing positional index in
         // TRADE_SELECT_COLS / read_trade_row shifts.
-        let strike_cols: [(&str, &str, &str); 4] = [
+        let strike_cols: [(&str, &str, &str); 5] = [
             ("trades", "twap_delta_pct_at_entry", "REAL"),
             ("trades", "twap_strike_at_entry", "TEXT"),
             ("trades", "used_twap_strike", "INTEGER"),
             // Lets agreement be measured on REJECTED signals too, not just
             // entered ones.
             ("signals", "twap_delta_pct", "REAL"),
+            ("trades", "twap_source_at_entry", "TEXT"),
         ];
         for (table, name, ty) in &strike_cols {
             if !column_exists(&conn, table, name) {
@@ -289,7 +292,7 @@ impl Database {
         // pre-existing twap_observations table (from an earlier build) is
         // widened in place rather than dropped/recreated. Additive and
         // NULL-defaulted; no existing data is touched.
-        let twap_cols: [(&str, &str); 17] = [
+        let twap_cols: [(&str, &str); 18] = [
             ("twap_30_at_open", "TEXT"),
             ("twap_30_at_open_ms", "INTEGER"),
             ("twap_30_at_entry", "TEXT"),
@@ -307,6 +310,8 @@ impl Database {
             ("resolution_event_ms", "INTEGER"),
             ("expected_up_token", "TEXT"),
             ("expected_down_token", "TEXT"),
+            // Which feed produced the stored TWAP values for this window.
+            ("twap_source", "TEXT"),
         ];
         for (name, ty) in &twap_cols {
             if !column_exists(&conn, "twap_observations", name) {
@@ -338,19 +343,21 @@ impl Database {
         twap_observed_ms: Option<i64>,
         snapshot_price: Option<f64>,
         captured_at_ms: i64,
+        source: Option<&str>,
     ) {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = conn.execute(
             "INSERT INTO twap_observations (
                 window_ts, twap_30_at_open, twap_30_at_open_ms,
-                snapshot_price_at_open, open_captured_at_ms, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                snapshot_price_at_open, open_captured_at_ms, twap_source, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(window_ts) DO UPDATE SET
                 twap_30_at_open = excluded.twap_30_at_open,
                 twap_30_at_open_ms = excluded.twap_30_at_open_ms,
                 snapshot_price_at_open = excluded.snapshot_price_at_open,
                 open_captured_at_ms = excluded.open_captured_at_ms,
+                twap_source = COALESCE(excluded.twap_source, twap_observations.twap_source),
                 updated_at = excluded.updated_at",
             params![
                 window_ts,
@@ -358,6 +365,7 @@ impl Database {
                 twap_observed_ms,
                 snapshot_price,
                 captured_at_ms,
+                source,
                 now
             ],
         ) {
@@ -479,19 +487,21 @@ impl Database {
         twap_observed_ms: Option<i64>,
         snapshot_price: Option<f64>,
         captured_at_ms: i64,
+        source: Option<&str>,
     ) {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = conn.execute(
             "INSERT INTO twap_observations (
                 window_ts, twap_30_at_resolve, twap_30_at_resolve_ms,
-                snapshot_price_at_resolve, resolve_captured_at_ms, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                snapshot_price_at_resolve, resolve_captured_at_ms, twap_source, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(window_ts) DO UPDATE SET
                 twap_30_at_resolve = excluded.twap_30_at_resolve,
                 twap_30_at_resolve_ms = excluded.twap_30_at_resolve_ms,
                 snapshot_price_at_resolve = excluded.snapshot_price_at_resolve,
                 resolve_captured_at_ms = excluded.resolve_captured_at_ms,
+                twap_source = COALESCE(excluded.twap_source, twap_observations.twap_source),
                 updated_at = excluded.updated_at",
             params![
                 window_ts,
@@ -499,6 +509,7 @@ impl Database {
                 twap_observed_ms,
                 snapshot_price,
                 captured_at_ms,
+                source,
                 now
             ],
         ) {
@@ -521,7 +532,8 @@ impl Database {
                 limit_price, fill_price, fill_attempts,
                 signal_detected_ms, order_sent_ms, order_ack_ms,
                 bot_version, neg_risk,
-                twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike
+                twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike,
+                twap_source_at_entry
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10, ?11,
@@ -534,7 +546,8 @@ impl Database {
                 ?26, ?27, ?28,
                 ?29, ?30, ?31,
                 ?32, ?33,
-                ?34, ?35, ?36
+                ?34, ?35, ?36,
+                ?37
              )",
             params![
                 trade.timestamp,
@@ -573,6 +586,7 @@ impl Database {
                 trade.twap_delta_pct_at_entry,
                 trade.twap_strike_at_entry,
                 trade.used_twap_strike as i32,
+                trade.twap_source_at_entry,
             ],
         )?;
         Ok(conn.last_insert_rowid())
