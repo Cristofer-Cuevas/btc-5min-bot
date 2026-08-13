@@ -24,6 +24,10 @@ pub struct RuntimeConfig {
     pub bet_shares: f64,
     pub max_slippage: f64,
     pub min_trend_strength: f64,
+    /// Minimum |delta_now| / |delta_past| ratio required to enter. Below this
+    /// the move is contracting (reversing toward zero) and the signal is
+    /// rejected as "delta_reversing". 0.0 disables the filter entirely.
+    pub min_delta_momentum: f64,
 
     // Risk limits
     pub max_consecutive_losses: i64,
@@ -131,6 +135,24 @@ impl RuntimeConfig {
             }
         };
 
+        let min_delta_momentum = {
+            let raw: f64 = env::var("MIN_DELTA_MOMENTUM")
+                .unwrap_or_else(|_| "0.70".into())
+                .parse()
+                .unwrap_or(0.70);
+            // 0.0 is a valid value meaning "filter disabled", so the lower
+            // bound is inclusive.
+            if (0.0..=5.0).contains(&raw) {
+                raw
+            } else {
+                tracing::warn!(
+                    "MIN_DELTA_MOMENTUM {:.4} outside [0.0, 5.0]; clamping to default 0.70",
+                    raw
+                );
+                0.70
+            }
+        };
+
         let db_path = env::var("DB_PATH").unwrap_or_else(|_| "trades.db".into());
 
         let max_consecutive_losses: i64 = env::var("MAX_CONSECUTIVE_LOSSES")
@@ -209,6 +231,7 @@ impl RuntimeConfig {
             bet_shares,
             max_slippage,
             min_trend_strength,
+            min_delta_momentum,
             max_consecutive_losses,
             daily_loss_limit_usdc,
             poly_proxy_address,

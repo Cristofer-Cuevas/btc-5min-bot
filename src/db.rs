@@ -23,7 +23,8 @@ const TRADE_SELECT_COLS: &str = "\
     bot_version, neg_risk, \
     twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike, \
     twap_source_at_entry, \
-    binance_twap_delta_at_entry, binance_twap_strike_at_entry";
+    binance_twap_delta_at_entry, binance_twap_strike_at_entry, \
+    delta_momentum_at_entry";
 
 /// True if `table` already has a column named `column`, per pragma table_info.
 /// Used to guard additive migrations so re-running init is a no-op instead of
@@ -101,6 +102,7 @@ fn read_trade_row(row: &Row) -> rusqlite::Result<TradeRecord> {
         twap_source_at_entry: row.get(41)?,
         binance_twap_delta_at_entry: row.get(42)?,
         binance_twap_strike_at_entry: row.get(43)?,
+        delta_momentum_at_entry: row.get(44)?,
     })
 }
 
@@ -296,7 +298,7 @@ impl Database {
         // Binance values are REAL (the feed publishes floats); Chainlink values
         // stay TEXT holding raw E18, so the two representations never share a
         // column.
-        let binance_twap_cols: [(&str, &str, &str); 17] = [
+        let binance_twap_cols: [(&str, &str, &str); 21] = [
             ("signals", "binance_twap_delta_pct", "REAL"),
             ("signals", "binance_twap_value", "REAL"),
             ("signals", "binance_twap_strike", "REAL"),
@@ -318,6 +320,13 @@ impl Database {
             // TRADE_SELECT_COLS / read_trade_row shifts.
             ("trades", "binance_twap_delta_at_entry", "REAL"),
             ("trades", "binance_twap_strike_at_entry", "REAL"),
+            // Delta-momentum filter. The past value and its age are recorded
+            // alongside the ratio so a genuine reversal can be told apart from
+            // a comparison against a stale or too-recent reading.
+            ("signals", "delta_momentum", "REAL"),
+            ("signals", "delta_past_value", "REAL"),
+            ("signals", "delta_past_age_ms", "INTEGER"),
+            ("trades", "delta_momentum_at_entry", "REAL"),
         ];
         for (table, name, ty) in &binance_twap_cols {
             if !column_exists(&conn, table, name) {
@@ -590,7 +599,8 @@ impl Database {
                 bot_version, neg_risk,
                 twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike,
                 twap_source_at_entry,
-                binance_twap_delta_at_entry, binance_twap_strike_at_entry
+                binance_twap_delta_at_entry, binance_twap_strike_at_entry,
+                delta_momentum_at_entry
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10, ?11,
@@ -605,7 +615,8 @@ impl Database {
                 ?32, ?33,
                 ?34, ?35, ?36,
                 ?37,
-                ?38, ?39
+                ?38, ?39,
+                ?40
              )",
             params![
                 trade.timestamp,
@@ -647,6 +658,7 @@ impl Database {
                 trade.twap_source_at_entry,
                 trade.binance_twap_delta_at_entry,
                 trade.binance_twap_strike_at_entry,
+                trade.delta_momentum_at_entry,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -676,9 +688,11 @@ impl Database {
                 binance_spot_price, chainlink_twap_value, chainlink_twap_strike,
                 binance_buffer_span_ms, binance_buffer_samples,
                 chainlink_twap_observed_ms, signal_evaluated_at_ms,
-                binance_newest_sample_ms
+                binance_newest_sample_ms,
+                delta_momentum, delta_past_value, delta_past_age_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                       ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                       ?26, ?27, ?28)",
             params![
                 now_ms,
                 window_ts,
@@ -707,6 +721,9 @@ impl Database {
                 ctx.chainlink_twap_observed_ms,
                 ctx.signal_evaluated_at_ms,
                 ctx.binance_newest_sample_ms,
+                eval.delta_momentum,
+                eval.delta_past_value,
+                eval.delta_past_age_ms,
             ],
         ) {
             error!("Failed to insert signal: {}", e);

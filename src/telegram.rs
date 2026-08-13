@@ -169,6 +169,17 @@ async fn handle_update(
                 "Usage: /set_shares 10".into()
             }
         }
+        "/set_momentum" => {
+            if let Some(val) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
+                if !(0.0..=5.0).contains(&val) {
+                    "Min delta momentum must be between 0.00 and 5.00 (0 disables)".into()
+                } else {
+                    set_param(config, db, "min_delta_momentum", val).await
+                }
+            } else {
+                "Usage: /set_momentum 0.70".into()
+            }
+        }
         "/set_slippage" => {
             if let Some(val) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
                 if !(0.0..=0.20).contains(&val) {
@@ -334,6 +345,7 @@ fn build_help() -> String {
      /set_shares &lt;n&gt; — bet size in shares (min 5)\n\
      /set_slippage &lt;val&gt; — limit = ask + slippage (0.00–0.20)\n\
      /set_trend &lt;val&gt; — min trend strength (0.0–1.0)\n\
+     /set_momentum &lt;val&gt; — min delta momentum (0.0–5.0, 0 disables)\n\
      \n\
      <b>Control</b>\n\
      /pause — stop entering new trades\n\
@@ -353,6 +365,7 @@ async fn build_config_display(config: &SharedConfig) -> String {
          Bet shares: {:.0}\n\
          Max slippage: ${:.2}\n\
          Min trend strength: {:.2}\n\
+         Min delta momentum: {:.2}\n\
          Dry run: {}\n\
          Has credentials: {}",
         cfg.btc_threshold_pct,
@@ -361,6 +374,7 @@ async fn build_config_display(config: &SharedConfig) -> String {
         cfg.bet_shares,
         cfg.max_slippage,
         cfg.min_trend_strength,
+        cfg.min_delta_momentum,
         cfg.dry_run,
         cfg.has_trading_credentials(),
     )
@@ -407,6 +421,11 @@ async fn set_param(config: &SharedConfig, db: &Arc<Database>, param: &str, val: 
         "min_trend_strength" => {
             let old = cfg.min_trend_strength;
             cfg.min_trend_strength = val;
+            old
+        }
+        "min_delta_momentum" => {
+            let old = cfg.min_delta_momentum;
+            cfg.min_delta_momentum = val;
             old
         }
         _ => return format!("Unknown parameter: {}", param),

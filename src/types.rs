@@ -354,6 +354,25 @@ pub struct WindowState {
     pub binance_twap_strike: Option<f64>,
     /// Bot wall-clock at the Binance strike capture.
     pub binance_twap_strike_ms: Option<i64>,
+    /// Rolling history of (timestamp_ms, delta_pct) for the current window,
+    /// used to detect whether the move is expanding or reversing. Cleared on
+    /// window rotation.
+    ///
+    /// Holds the DECISION delta — whichever of the spot/TWAP deltas actually
+    /// drives the threshold check for the active mode — so momentum is always
+    /// measured on the same series the entry is based on.
+    pub delta_history: VecDeque<(i64, f64)>,
+}
+
+/// Result of a delta-momentum measurement, including the comparison point so a
+/// genuine reversal can be told apart from a comparison against a stale or
+/// too-recent reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeltaMomentum {
+    /// |delta_now| / |delta_past|. Below 1.0 the move is contracting.
+    pub ratio: f64,
+    pub past_value: f64,
+    pub past_age_ms: i64,
 }
 
 /// SHADOW / DATA COLLECTION ONLY. Context gathered at signal-write time so the
@@ -388,6 +407,71 @@ impl WindowState {
         while self.twap_coverage_recent.len() > crate::constants::TWAP_COVERAGE_WINDOW {
             self.twap_coverage_recent.pop_front();
         }
+    }
+
+    /// Record the decision delta for this evaluation, trimming entries beyond
+    /// `DELTA_HISTORY_WINDOW_MS` and capping length defensively.
+    pub fn push_delta(&mut self, ts_ms: i64, delta: f64) {
+        self.delta_history.push_back((ts_ms, delta));
+
+        let cutoff = ts_ms - crate::constants::DELTA_HISTORY_WINDOW_MS;
+        while let Some(&(front_ts, _)) = self.delta_history.front() {
+            if front_ts < cutoff {
+                self.delta_history.pop_front();
+            } else {
+                break;
+            }
+        }
+        while self.delta_history.len() > crate::constants::DELTA_HISTORY_MAX_ENTRIES {
+            self.delta_history.pop_front();
+        }
+    }
+
+    /// Returns the ratio |delta_now| / |delta_past|, where delta_past is the
+    /// oldest entry in the history that is at least DELTA_MOMENTUM_MIN_AGE_MS
+    /// old.
+    ///
+    ///   ratio < 1.0  -> move is CONTRACTING (reversing toward zero)
+    ///   ratio > 1.0  -> move is EXPANDING (continuing)
+    ///
+    /// Returns None if there is no history entry old enough to compare
+    /// against, or if |delta_past| is too small to form a meaningful ratio
+    /// (guard against division by ~zero).
+    pub fn delta_momentum(&self, delta_now: f64, now_ms: i64) -> Option<f64> {
+        self.delta_momentum_detail(delta_now, now_ms).map(|d| d.ratio)
+    }
+
+    /// As [`Self::delta_momentum`], but also reports the comparison point.
+    pub fn delta_momentum_detail(&self, delta_now: f64, now_ms: i64) -> Option<DeltaMomentum> {
+        // The deque is oldest-first, so the first entry meeting the age
+        // requirement is the OLDEST qualifying one — the comparison therefore
+        // spans the full available lookback rather than the shortest.
+        let &(past_ts, past_value) = self.delta_history.iter().find(|(ts, _)| {
+            now_ms.saturating_sub(*ts) >= crate::constants::DELTA_MOMENTUM_MIN_AGE_MS
+        })?;
+
+        // Too small a denominator makes the ratio meaningless, not merely large.
+        if past_value.abs() < 1e-6 {
+            return None;
+        }
+
+        let past_age_ms = now_ms.saturating_sub(past_ts);
+
+        // A sign flip means the move already crossed through zero: the
+        // strongest possible reversal signal, so it fails any threshold.
+        let flipped = (delta_now > 0.0 && past_value < 0.0)
+            || (delta_now < 0.0 && past_value > 0.0);
+        let ratio = if flipped {
+            0.0
+        } else {
+            delta_now.abs() / past_value.abs()
+        };
+
+        Some(DeltaMomentum {
+            ratio,
+            past_value,
+            past_age_ms,
+        })
     }
 
     /// (fresh_count, sample_count, rtds_count, chainlink_count) over the
@@ -469,6 +553,8 @@ pub struct TradeRecord {
     // SHADOW ONLY — recorded for offline analysis, never read by a decision.
     pub binance_twap_delta_at_entry: Option<f64>,
     pub binance_twap_strike_at_entry: Option<f64>,
+    /// Delta-momentum ratio at the moment the order was placed.
+    pub delta_momentum_at_entry: Option<f64>,
 }
 
 // ── Strategy Evaluation Result ──
@@ -493,6 +579,14 @@ pub struct EvaluationResult {
     /// and persisted for offline analysis; never read by any gate, threshold,
     /// side selection, or ordering decision in either mode.
     pub binance_twap_delta_pct: Option<f64>,
+    /// The delta that actually drove the threshold check and side selection,
+    /// respecting use_twap_strike. Single source of truth for what gets pushed
+    /// into the delta history.
+    pub decision_delta: Option<f64>,
+    /// Delta-momentum ratio and its comparison point, when measurable.
+    pub delta_momentum: Option<f64>,
+    pub delta_past_value: Option<f64>,
+    pub delta_past_age_ms: Option<i64>,
 }
 
 impl EvaluationResult {
@@ -510,6 +604,10 @@ impl EvaluationResult {
             side: None,
             twap_delta_pct: None,
             binance_twap_delta_pct: None,
+            decision_delta: None,
+            delta_momentum: None,
+            delta_past_value: None,
+            delta_past_age_ms: None,
         }
     }
 }
@@ -791,6 +889,123 @@ mod rtds_tests {
         assert_eq!(binance_twap_delta_pct(f64::NAN, 100.0), None);
         let d = binance_twap_delta_pct(100.0, 99.0).unwrap();
         assert!(d < 0.0);
+    }
+
+    // ── Delta momentum ──
+
+    const NOW_MS: i64 = 1_786_624_500_000;
+
+    fn ws_with(history: &[(i64, f64)]) -> WindowState {
+        WindowState {
+            delta_history: history.iter().copied().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The actual losing trade: window 1786624200 went -0.15223 -> -0.03775.
+    #[test]
+    fn contracting_delta_is_rejected_at_default() {
+        let ws = ws_with(&[(NOW_MS - 45_000, -0.15223)]);
+        let ratio = ws.delta_momentum(-0.03775, NOW_MS).unwrap();
+        assert!(
+            (ratio - 0.2480).abs() < 1e-3,
+            "expected ~0.248, got {ratio}"
+        );
+        assert!(ratio < 0.70, "must fail the 0.70 default");
+    }
+
+    /// The mirror image: a move growing at the same rate must pass.
+    #[test]
+    fn expanding_delta_passes() {
+        let ws = ws_with(&[(NOW_MS - 45_000, -0.03775)]);
+        let ratio = ws.delta_momentum(-0.15223, NOW_MS).unwrap();
+        assert!((ratio - 4.032).abs() < 1e-2, "expected ~4.03, got {ratio}");
+        assert!(ratio >= 0.70);
+    }
+
+    /// A sign flip means the move already crossed zero — the strongest reversal.
+    #[test]
+    fn sign_flip_returns_zero() {
+        let ws = ws_with(&[(NOW_MS - 30_000, -0.05)]);
+        assert_eq!(ws.delta_momentum(0.03, NOW_MS), Some(0.0));
+        let ws = ws_with(&[(NOW_MS - 30_000, 0.05)]);
+        assert_eq!(ws.delta_momentum(-0.03, NOW_MS), Some(0.0));
+    }
+
+    /// Identical magnitude, opposite meaning — the bug this filter fixes.
+    #[test]
+    fn same_delta_opposite_meaning() {
+        let contracting = ws_with(&[(NOW_MS - 30_000, -0.152)])
+            .delta_momentum(-0.038, NOW_MS)
+            .unwrap();
+        let expanding = ws_with(&[(NOW_MS - 30_000, -0.005)])
+            .delta_momentum(-0.038, NOW_MS)
+            .unwrap();
+        assert!(contracting < 0.70, "contracting {contracting} must reject");
+        assert!(expanding >= 0.70, "expanding {expanding} must pass");
+    }
+
+    /// Too-recent history cannot judge momentum, and must return None (which
+    /// the gate treats as "do not reject").
+    #[test]
+    fn insufficient_history_returns_none() {
+        assert_eq!(ws_with(&[]).delta_momentum(-0.05, NOW_MS), None);
+        // Present but younger than DELTA_MOMENTUM_MIN_AGE_MS.
+        let ws = ws_with(&[(NOW_MS - 19_999, -0.15)]);
+        assert_eq!(ws.delta_momentum(-0.05, NOW_MS), None);
+        // Exactly at the minimum age qualifies.
+        let ws = ws_with(&[(NOW_MS - 20_000, -0.15)]);
+        assert!(ws.delta_momentum(-0.05, NOW_MS).is_some());
+    }
+
+    /// A near-zero denominator makes the ratio meaningless, not merely large.
+    #[test]
+    fn tiny_past_value_returns_none() {
+        let ws = ws_with(&[(NOW_MS - 30_000, 1e-9)]);
+        assert_eq!(ws.delta_momentum(0.05, NOW_MS), None);
+    }
+
+    /// The comparison spans the FULL lookback: the oldest qualifying entry is
+    /// used, not the newest.
+    #[test]
+    fn uses_oldest_qualifying_entry() {
+        let ws = ws_with(&[
+            (NOW_MS - 40_000, -0.20), // oldest qualifying -> should be chosen
+            (NOW_MS - 25_000, -0.10),
+            (NOW_MS - 5_000, -0.05), // too recent
+        ]);
+        let d = ws.delta_momentum_detail(-0.05, NOW_MS).unwrap();
+        assert_eq!(d.past_value, -0.20);
+        assert_eq!(d.past_age_ms, 40_000);
+        assert!((d.ratio - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn push_delta_trims_and_caps() {
+        let mut ws = WindowState::default();
+        // Entries older than the window are dropped.
+        ws.push_delta(NOW_MS - 60_000, -0.1);
+        ws.push_delta(NOW_MS, -0.2);
+        assert_eq!(ws.delta_history.len(), 1, "stale entry should be trimmed");
+
+        let mut ws = WindowState::default();
+        for i in 0..(crate::constants::DELTA_HISTORY_MAX_ENTRIES + 50) {
+            ws.push_delta(NOW_MS + i as i64, -0.1);
+        }
+        assert_eq!(
+            ws.delta_history.len(),
+            crate::constants::DELTA_HISTORY_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn history_clears_on_rotation() {
+        let mut ws = ws_with(&[(NOW_MS - 30_000, -0.15), (NOW_MS, -0.05)]);
+        assert!(!ws.delta_history.is_empty());
+        // Rotation clears it, as main.rs does alongside the other resets.
+        ws.delta_history.clear();
+        assert!(ws.delta_history.is_empty());
+        assert_eq!(ws.delta_momentum(-0.05, NOW_MS), None);
     }
 
     #[test]

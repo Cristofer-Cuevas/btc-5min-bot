@@ -32,6 +32,19 @@ pub const TWAP_RECONNECT_AFTER_MS: u64 = 120_000;
 /// How many recent windows the TWAP coverage counter tracks.
 pub const TWAP_COVERAGE_WINDOW: usize = 20;
 
+/// How far back to look when measuring whether the delta is expanding or
+/// contracting.
+pub const DELTA_HISTORY_WINDOW_MS: i64 = 45_000;
+
+/// Minimum lookback age required before momentum can be judged. Without
+/// this, early-window evaluations compare against a near-identical
+/// reading and always look flat.
+pub const DELTA_MOMENTUM_MIN_AGE_MS: i64 = 20_000;
+
+/// Defensive cap on delta history length. At a 250ms tick the 45s window holds
+/// ~180 entries; this only bounds growth if a window somehow stalls.
+pub const DELTA_HISTORY_MAX_ENTRIES: usize = 1200;
+
 /// Lookback for the Binance-derived TWAP estimate, matched to Polymarket's
 /// 30s settlement TWAP for 5-minute markets.
 pub const BINANCE_TWAP_WINDOW_MS: u64 = 30_000;

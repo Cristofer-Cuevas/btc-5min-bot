@@ -4,6 +4,7 @@ use crate::config::RuntimeConfig;
 use crate::constants::*;
 use crate::types::{
     BinanceBtcPrice, BtcPriceState, EntrySignal, EvaluationResult, MarketState, MarketWindow,
+    WindowState,
 };
 
 /// Evaluate Strategy A entry conditions.
@@ -20,6 +21,7 @@ pub fn evaluate_entry(
     secs_left: i64,
     twap_strike: Option<&str>,
     binance_twap_strike: Option<f64>,
+    window_state: &WindowState,
 ) -> EvaluationResult {
     let mut r = EvaluationResult::rejected("entered");
 
@@ -77,10 +79,44 @@ pub fn evaluate_entry(
     };
 
     r.side = Some(if decision_delta > 0.0 { "Up" } else { "Down" }.into());
+    // Single source of truth for what the delta history records, so momentum
+    // is always measured on the series that actually drives entries.
+    r.decision_delta = Some(decision_delta);
 
     if decision_delta.abs() < config.btc_threshold_pct {
         r.rejection_reason = "below_threshold";
         return r;
+    }
+
+    // Record the momentum measurement regardless of outcome, so rejected and
+    // accepted signals are equally analysable.
+    if let Some(d) = window_state.delta_momentum_detail(decision_delta, now_ms) {
+        r.delta_momentum = Some(d.ratio);
+        r.delta_past_value = Some(d.past_value);
+        r.delta_past_age_ms = Some(d.past_age_ms);
+    }
+
+    // A delta shrinking toward zero means the move is reversing, even if its
+    // magnitude still clears the threshold. Entering there bets against a
+    // trend that is visibly in progress.
+    match window_state.delta_momentum(decision_delta, now_ms) {
+        Some(ratio) if ratio < config.min_delta_momentum => {
+            debug!(
+                "Delta momentum {:.2} below {:.2} — move is reversing",
+                ratio, config.min_delta_momentum
+            );
+            r.rejection_reason = "delta_reversing";
+            return r;
+        }
+        Some(ratio) => {
+            debug!("Delta momentum {:.2} OK", ratio);
+        }
+        None => {
+            // Not enough history yet (early in the window). Do NOT reject —
+            // this differs deliberately from the trend/depth gates, because a
+            // missing history is a normal early-window state, not a data
+            // failure. The threshold check already guards magnitude.
+        }
     }
 
     r.trend_strength = binance.trend_strength();
@@ -248,6 +284,9 @@ mod strike_mode_tests {
             bet_shares: 5.0,
             max_slippage: 0.03,
             min_trend_strength: 0.41,
+            // Disabled by default in fixtures so pre-existing tests exercise
+            // the gates they were written for; momentum tests opt in.
+            min_delta_momentum: 0.0,
             max_consecutive_losses: 3,
             daily_loss_limit_usdc: 20.0,
             poly_proxy_address: String::new(),
@@ -304,6 +343,7 @@ mod strike_mode_tests {
             60,
             strike,
             None,
+            &WindowState::default(),
         )
     }
 
@@ -352,9 +392,22 @@ mod strike_mode_tests {
             ..Default::default()
         };
         let (ms, win) = market();
-        let r = evaluate_entry(&cfg(true), &stale, &binance_up(), &ms, &win, 60, Some(STRIKE), None);
+        let r = evaluate_entry(&cfg(true), &stale, &binance_up(), &ms, &win, 60, Some(STRIKE), None, &WindowState::default());
         assert_eq!(r.rejection_reason, "twap_unavailable");
         assert_eq!(r.twap_delta_pct, None);
+    }
+
+    /// RTDS spot state AGREEING with `binance_up_trending()` (both up), so
+    /// downstream gates do not mask what a test is exercising.
+    fn btc_rtds_agrees() -> BtcPriceState {
+        BtcPriceState {
+            current_price: Some(65_100.0),
+            window_open_price: Some(65_000.0),
+            last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
+            twap_30_value: Some("64800000000000000000000".into()),
+            twap_30_observed_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            ..Default::default()
+        }
     }
 
     /// RTDS spot state that disagrees in direction with `binance_up()`:
@@ -411,6 +464,7 @@ mod strike_mode_tests {
                     secs,
                     Some(STRIKE),
                     None,
+                    &WindowState::default(),
                 );
                 // A strike far ABOVE the current Binance TWAP, so the shadow
                 // delta is strongly negative regardless of the real signal.
@@ -423,6 +477,7 @@ mod strike_mode_tests {
                     secs,
                     Some(STRIKE),
                     Some(99_000.0),
+                    &WindowState::default(),
                 );
 
                 assert_eq!(
@@ -449,6 +504,106 @@ mod strike_mode_tests {
         }
     }
 
+    // ── Delta momentum gate ──
+
+    fn cfg_momentum(use_twap_strike: bool, min_delta_momentum: f64) -> RuntimeConfig {
+        RuntimeConfig {
+            min_delta_momentum,
+            ..cfg(use_twap_strike)
+        }
+    }
+
+    /// History old enough to judge, holding `past` as the comparison point.
+    fn ws_hist(past: f64) -> WindowState {
+        let now = chrono::Utc::now().timestamp_millis();
+        WindowState {
+            delta_history: [(now - 30_000, past)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn eval_momentum(cfg: &RuntimeConfig, ws: &WindowState) -> EvaluationResult {
+        let (ms, win) = market();
+        evaluate_entry(
+            cfg,
+            &btc_rtds_agrees(),
+            &binance_up_trending(),
+            &ms,
+            &win,
+            60,
+            Some(STRIKE),
+            None,
+            ws,
+        )
+    }
+
+    /// Reproduces the losing trade: spot delta +0.20% (passes threshold) but
+    /// the history shows it contracted from a much larger move.
+    #[test]
+    fn contracting_delta_is_rejected_by_the_gate() {
+        // binance_up_trending() gives +0.20%; a past of +0.80% -> ratio 0.25.
+        let r = eval_momentum(&cfg_momentum(false, 0.70), &ws_hist(0.80));
+        assert_eq!(r.rejection_reason, "delta_reversing");
+        let ratio = r.delta_momentum.expect("ratio recorded");
+        assert!((ratio - 0.25).abs() < 1e-6, "got {ratio}");
+        assert_eq!(r.delta_past_value, Some(0.80));
+        assert!(r.delta_past_age_ms.unwrap() >= DELTA_MOMENTUM_MIN_AGE_MS);
+    }
+
+    /// An expanding move passes the gate and continues to the later checks.
+    #[test]
+    fn expanding_delta_passes_the_gate() {
+        let r = eval_momentum(&cfg_momentum(false, 0.70), &ws_hist(0.05));
+        assert_ne!(r.rejection_reason, "delta_reversing");
+        assert!(r.delta_momentum.unwrap() > 1.0);
+    }
+
+    /// MIN_DELTA_MOMENTUM=0.0 disables the filter: a ratio of 0.0 (sign flip)
+    /// still passes, so behaviour is identical to before this change.
+    #[test]
+    fn zero_config_disables_the_filter() {
+        // Sign flip: the most extreme reversal signal possible.
+        let r = eval_momentum(&cfg_momentum(false, 0.0), &ws_hist(-0.80));
+        assert_eq!(r.delta_momentum, Some(0.0), "ratio is 0.0 (sign flip)");
+        assert_ne!(
+            r.rejection_reason, "delta_reversing",
+            "0.0 must disable the gate entirely"
+        );
+    }
+
+    /// Missing history must NOT reject — a deliberate exception to the
+    /// fail-closed pattern, since an empty history is normal early in a window.
+    #[test]
+    fn missing_history_does_not_reject() {
+        let r = eval_momentum(&cfg_momentum(false, 0.70), &WindowState::default());
+        assert_ne!(r.rejection_reason, "delta_reversing");
+        assert_eq!(r.delta_momentum, None);
+        assert_eq!(r.delta_past_value, None);
+    }
+
+    /// The gate must measure the delta that actually drives the decision.
+    /// Same history, same inputs — only the flag differs, and the recorded
+    /// decision delta follows it.
+    #[test]
+    fn momentum_uses_the_deciding_delta_for_the_mode() {
+        // Spot delta is +0.20%; the TWAP delta here is negative (64800 vs the
+        // 65000 strike), so the two modes must record different values.
+        let spot = eval_momentum(&cfg_momentum(false, 0.0), &ws_hist(0.05));
+        let twap = eval_momentum(&cfg_momentum(true, 0.0), &ws_hist(0.05));
+
+        let spot_d = spot.decision_delta.expect("spot decision delta");
+        let twap_d = twap.decision_delta.expect("twap decision delta");
+        assert!(spot_d > 0.0, "spot mode should use the +0.20% spot delta");
+        assert!(twap_d < 0.0, "twap mode should use the negative twap delta");
+        assert_eq!(spot.btc_delta_pct, twap.btc_delta_pct, "spot delta recorded in both");
+        assert_ne!(spot_d, twap_d, "the deciding delta must differ by mode");
+
+        // And the ratio is computed from that mode's delta: twap mode flips
+        // sign against the +0.05 history, so its ratio is 0.0.
+        assert_eq!(twap.delta_momentum, Some(0.0));
+        assert!(spot.delta_momentum.unwrap() > 1.0);
+    }
+
     /// Guard: the fixture really does clear the trend gate, otherwise the two
     /// tests below would pass for the wrong reason.
     #[test]
@@ -470,6 +625,7 @@ mod strike_mode_tests {
             60,
             Some(STRIKE),
             None,
+            &WindowState::default(),
         );
         assert_eq!(r.rejection_reason, "rtds_mismatch");
     }
@@ -489,6 +645,7 @@ mod strike_mode_tests {
             60,
             Some(STRIKE),
             None,
+            &WindowState::default(),
         );
         assert_ne!(r.rejection_reason, "rtds_mismatch");
         // Empty book, so the next gate it reaches is the ask check.
@@ -555,6 +712,7 @@ mod strike_mode_tests {
             60,
             Some(STRIKE),
             None,
+            &WindowState::default(),
         );
         assert_eq!(before.rejection_reason, "market_resolved");
 
@@ -572,6 +730,7 @@ mod strike_mode_tests {
             60,
             Some(STRIKE),
             None,
+            &WindowState::default(),
         );
         assert_ne!(
             after.rejection_reason, "market_resolved",
@@ -601,6 +760,7 @@ mod strike_mode_tests {
             60,
             Some(STRIKE),
             None,
+            &WindowState::default(),
         );
         assert_eq!(r.rejection_reason, "below_threshold");
         assert_eq!(r.side.as_deref(), Some("Up"));

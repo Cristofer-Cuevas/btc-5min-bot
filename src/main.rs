@@ -383,6 +383,9 @@ async fn main() {
                 // SHADOW ONLY: same for the Binance-derived strike.
                 ws.binance_twap_strike = None;
                 ws.binance_twap_strike_ms = None;
+                // Momentum is measured within a window only — a delta from the
+                // previous window would compare across a strike reset.
+                ws.delta_history.clear();
             }
 
             // Reset market state. MarketState is shared across windows and
@@ -689,6 +692,13 @@ async fn main() {
                 // time, so the row is not left empty.
                 twap_delta_pct: None,
                 binance_twap_delta_pct: None,
+                // A retry replays a signal that already cleared the momentum
+                // gate; no fresh measurement is taken, so nothing is recorded
+                // and nothing is pushed into the delta history.
+                decision_delta: None,
+                delta_momentum: None,
+                delta_past_value: None,
+                delta_past_age_ms: None,
             };
             (r, dry_run)
         } else {
@@ -719,6 +729,7 @@ async fn main() {
                         secs_left,
                         ws.twap_strike.as_deref(),
                         ws.binance_twap_strike,
+                        &ws,
                     )
                 }
             } else {
@@ -727,6 +738,17 @@ async fn main() {
 
             (result, dry_run)
         };
+
+        // Record the decision delta for momentum measurement. Pushed AFTER the
+        // evaluation that read the history, so a reading never compares against
+        // itself. Nothing is pushed when no decision delta was produced (early
+        // rejections, or a stale TWAP in twap mode).
+        if let Some(d) = eval_result.decision_delta {
+            window_state
+                .write()
+                .await
+                .push_delta(chrono::Utc::now().timestamp_millis(), d);
+        }
 
         // Signal logging: skip plumbing-noise reasons entirely, always write
         // "entered", otherwise write only when rejection reason changes.
@@ -1039,6 +1061,7 @@ async fn main() {
                 // SHADOW ONLY — recorded, never consulted.
                 binance_twap_delta_at_entry: eval_result.binance_twap_delta_pct,
                 binance_twap_strike_at_entry: binance_twap_strike_entry,
+                delta_momentum_at_entry: eval_result.delta_momentum,
             };
 
             if let Err(e) = db.insert_trade(&trade) {
