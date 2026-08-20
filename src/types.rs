@@ -362,6 +362,49 @@ pub struct WindowState {
     /// drives the threshold check for the active mode — so momentum is always
     /// measured on the same series the entry is based on.
     pub delta_history: VecDeque<(i64, f64)>,
+
+    // ── DATA COLLECTION ONLY: per-window running extremes ──
+    // Read by no gate; recorded so entry patterns can be scored offline.
+    /// Running max |decision delta| seen this window, and when.
+    pub delta_peak_abs: Option<f64>,
+    pub delta_peak_ms: Option<i64>,
+    /// When |decision delta| first exceeded DELTA_RISE_FLOOR_PCT this window.
+    /// Together with delta_peak_ms this gives rise time: how fast the move
+    /// formed. A move that goes 0 -> 0.15% in 8 seconds is a spike; the same
+    /// move over 90 seconds is a trend. The momentum ratio cannot tell them
+    /// apart.
+    pub delta_first_cross_ms: Option<i64>,
+    /// Running max ask seen this window for the CURRENTLY SIGNALLED side, and
+    /// the max across both sides. Both are tracked because the signalled side
+    /// can flip mid-window: the signalled peak resets on a flip, the any-side
+    /// peak spans the whole window.
+    pub ask_peak_signalled_side: Option<f64>,
+    pub ask_peak_any_side: Option<f64>,
+    /// Rolling (timestamp_ms, ask_price) for the signalled side, 45s window,
+    /// same trim/cap discipline as delta_history. Cleared on rotation.
+    ///
+    /// Also cleared when the signalled side flips mid-window: splicing two
+    /// tokens' prices into one series would make the lookbacks meaningless.
+    /// This is why the series can legitimately be much shorter than 45s.
+    pub ask_history: VecDeque<(i64, f64)>,
+    /// Which side the last evaluation signalled, used only to detect a flip.
+    pub last_signalled_side: Option<String>,
+}
+
+/// Value in `hist` nearest to `age_ms` before `now_ms`, or None when the series
+/// does not reach back that far. Picks the NEAREST entry to the target age
+/// rather than the first one past it.
+fn nearest_at_age(hist: &VecDeque<(i64, f64)>, now_ms: i64, age_ms: i64) -> Option<f64> {
+    let target = now_ms - age_ms;
+    // Fail closed rather than returning the oldest available: a series that
+    // does not span the lookback cannot answer the question, and a substitute
+    // value would be indistinguishable from a real one.
+    if hist.front()?.0 > target {
+        return None;
+    }
+    hist.iter()
+        .min_by_key(|(ts, _)| (ts - target).abs())
+        .map(|(_, v)| *v)
 }
 
 /// Result of a delta-momentum measurement, including the comparison point so a
@@ -397,6 +440,22 @@ pub struct SignalShadowContext {
     /// measurement against the Binance series.
     pub chainlink_twap_observed_ms: Option<i64>,
     pub signal_evaluated_at_ms: i64,
+
+    // ── Entry-pattern diagnostics ──
+    // Written on EVERY signal including rejections, so rejected signals can be
+    // scored against twap_observations.actual_resolution. NULL whenever the
+    // history does not reach back far enough — never a substitute value, since
+    // a fabricated zero is indistinguishable from a real zero delta.
+    pub delta_peak_abs: Option<f64>,
+    pub delta_peak_secs_ago: Option<f64>,
+    pub delta_rise_time_s: Option<f64>,
+    pub delta_5s_ago: Option<f64>,
+    pub delta_15s_ago: Option<f64>,
+    pub delta_30s_ago: Option<f64>,
+    pub ask_5s_ago: Option<f64>,
+    pub ask_30s_ago: Option<f64>,
+    pub ask_peak_signalled: Option<f64>,
+    pub ask_peak_any: Option<f64>,
 }
 
 impl WindowState {
@@ -425,6 +484,99 @@ impl WindowState {
         while self.delta_history.len() > crate::constants::DELTA_HISTORY_MAX_ENTRIES {
             self.delta_history.pop_front();
         }
+    }
+
+    /// DATA COLLECTION ONLY. Update the window's running delta extremes from
+    /// the decision delta. Records the peak and the first crossing of
+    /// DELTA_RISE_FLOOR_PCT, whose difference is the move's rise time.
+    pub fn observe_delta_extremes(&mut self, ts_ms: i64, delta: f64) {
+        let abs = delta.abs();
+        if self.delta_peak_abs.map(|p| abs > p).unwrap_or(true) {
+            self.delta_peak_abs = Some(abs);
+            self.delta_peak_ms = Some(ts_ms);
+        }
+        if self.delta_first_cross_ms.is_none() && abs > crate::constants::DELTA_RISE_FLOOR_PCT {
+            self.delta_first_cross_ms = Some(ts_ms);
+        }
+    }
+
+    /// DATA COLLECTION ONLY. Record the observed asks for this evaluation.
+    ///
+    /// `signalled_ask` is the ask for the side currently signalled; `any_ask`
+    /// is the best ask across both sides. When the signalled side flips, the
+    /// ask series and its peak reset — they describe one token, and splicing
+    /// two tokens' prices together would make the lookbacks meaningless.
+    /// `ask_peak_any_side` deliberately survives a flip: it spans the window.
+    pub fn observe_ask(
+        &mut self,
+        ts_ms: i64,
+        side: Option<&str>,
+        signalled_ask: Option<f64>,
+        any_ask: Option<f64>,
+    ) {
+        if let Some(s) = side {
+            if self.last_signalled_side.as_deref() != Some(s) {
+                if self.last_signalled_side.is_some() {
+                    self.ask_history.clear();
+                    self.ask_peak_signalled_side = None;
+                }
+                self.last_signalled_side = Some(s.to_string());
+            }
+        }
+
+        if let Some(ask) = signalled_ask {
+            self.ask_history.push_back((ts_ms, ask));
+            let cutoff = ts_ms - crate::constants::DELTA_HISTORY_WINDOW_MS;
+            while let Some(&(front_ts, _)) = self.ask_history.front() {
+                if front_ts < cutoff {
+                    self.ask_history.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while self.ask_history.len() > crate::constants::DELTA_HISTORY_MAX_ENTRIES {
+                self.ask_history.pop_front();
+            }
+            if self.ask_peak_signalled_side.map(|p| ask > p).unwrap_or(true) {
+                self.ask_peak_signalled_side = Some(ask);
+            }
+        }
+
+        if let Some(ask) = any_ask {
+            if self.ask_peak_any_side.map(|p| ask > p).unwrap_or(true) {
+                self.ask_peak_any_side = Some(ask);
+            }
+        }
+    }
+
+    /// Value of the decision delta closest to `age_ms` before `now_ms`,
+    /// or None if history does not reach back that far.
+    /// Picks the entry NEAREST the target age, not the first one past it.
+    pub fn delta_at_age(&self, now_ms: i64, age_ms: i64) -> Option<f64> {
+        nearest_at_age(&self.delta_history, now_ms, age_ms)
+    }
+
+    /// As [`Self::delta_at_age`], for the signalled-side ask series.
+    pub fn ask_at_age(&self, now_ms: i64, age_ms: i64) -> Option<f64> {
+        nearest_at_age(&self.ask_history, now_ms, age_ms)
+    }
+
+    /// Seconds between the delta peak and `now_ms`, when a peak exists.
+    pub fn delta_peak_secs_ago(&self, now_ms: i64) -> Option<f64> {
+        self.delta_peak_ms
+            .map(|p| now_ms.saturating_sub(p) as f64 / 1000.0)
+    }
+
+    /// Seconds the move took to form: peak time minus first floor crossing.
+    /// None unless both are known; negative spans (a peak recorded before the
+    /// floor was crossed) are reported as None rather than a bogus value.
+    pub fn delta_rise_time_s(&self) -> Option<f64> {
+        let peak = self.delta_peak_ms?;
+        let first = self.delta_first_cross_ms?;
+        if peak < first {
+            return None;
+        }
+        Some((peak - first) as f64 / 1000.0)
     }
 
     /// Returns the ratio |delta_now| / |delta_past|, where delta_past is the
@@ -1006,6 +1158,118 @@ mod rtds_tests {
         ws.delta_history.clear();
         assert!(ws.delta_history.is_empty());
         assert_eq!(ws.delta_momentum(-0.05, NOW_MS), None);
+    }
+
+    // ── Entry-pattern diagnostics ──
+
+    #[test]
+    fn delta_at_age_picks_nearest_not_first_past() {
+        let ws = ws_with(&[
+            (NOW_MS - 30_000, -0.30),
+            (NOW_MS - 16_000, -0.16),
+            (NOW_MS - 14_000, -0.14),
+            (NOW_MS - 1_000, -0.01),
+        ]);
+        // Target 15s: 16s and 14s are both 1s away; the older wins on tie.
+        assert_eq!(ws.delta_at_age(NOW_MS, 15_000), Some(-0.16));
+        // Target 30s lands exactly on an entry.
+        assert_eq!(ws.delta_at_age(NOW_MS, 30_000), Some(-0.30));
+        // Target 5s: nearest is the 1s entry, and history reaches back past 5s.
+        assert_eq!(ws.delta_at_age(NOW_MS, 5_000), Some(-0.01));
+    }
+
+    #[test]
+    fn delta_at_age_is_none_when_history_too_short() {
+        let ws = ws_with(&[(NOW_MS - 4_000, -0.05)]);
+        assert_eq!(ws.delta_at_age(NOW_MS, 5_000), None, "must not substitute");
+        assert_eq!(ws.delta_at_age(NOW_MS, 30_000), None);
+        assert_eq!(ws_with(&[]).delta_at_age(NOW_MS, 5_000), None);
+    }
+
+    #[test]
+    fn delta_extremes_track_peak_and_rise_time() {
+        let mut ws = WindowState::default();
+        ws.observe_delta_extremes(NOW_MS - 40_000, 0.005); // under the floor
+        assert_eq!(ws.delta_first_cross_ms, None);
+        ws.observe_delta_extremes(NOW_MS - 30_000, 0.05); // crosses 0.02
+        ws.observe_delta_extremes(NOW_MS - 20_000, 0.15); // peak
+        ws.observe_delta_extremes(NOW_MS - 5_000, -0.09); // shrinking
+
+        assert_eq!(ws.delta_first_cross_ms, Some(NOW_MS - 30_000));
+        assert_eq!(ws.delta_peak_abs, Some(0.15));
+        assert_eq!(ws.delta_peak_ms, Some(NOW_MS - 20_000));
+        // Rise: crossed at -30s, peaked at -20s => 10s to form.
+        assert_eq!(ws.delta_rise_time_s(), Some(10.0));
+        assert_eq!(ws.delta_peak_secs_ago(NOW_MS), Some(20.0));
+    }
+
+    #[test]
+    fn delta_peak_uses_absolute_value() {
+        let mut ws = WindowState::default();
+        ws.observe_delta_extremes(NOW_MS - 10_000, -0.20);
+        ws.observe_delta_extremes(NOW_MS, 0.05);
+        assert_eq!(ws.delta_peak_abs, Some(0.20), "sign must not shrink the peak");
+        assert_eq!(ws.delta_peak_ms, Some(NOW_MS - 10_000));
+    }
+
+    #[test]
+    fn rise_time_none_without_both_marks() {
+        let mut ws = WindowState::default();
+        // Peak recorded but the floor never crossed.
+        ws.observe_delta_extremes(NOW_MS, 0.001);
+        assert!(ws.delta_peak_ms.is_some());
+        assert_eq!(ws.delta_rise_time_s(), None);
+    }
+
+    #[test]
+    fn ask_history_clears_on_side_flip() {
+        let mut ws = WindowState::default();
+        ws.observe_ask(NOW_MS - 30_000, Some("Up"), Some(0.40), Some(0.60));
+        ws.observe_ask(NOW_MS - 20_000, Some("Up"), Some(0.55), Some(0.55));
+        assert_eq!(ws.ask_history.len(), 2);
+        assert_eq!(ws.ask_peak_signalled_side, Some(0.55));
+        assert_eq!(ws.ask_peak_any_side, Some(0.60));
+
+        // Flip: the series and the signalled peak reset, the any-side peak does not.
+        ws.observe_ask(NOW_MS - 10_000, Some("Down"), Some(0.30), Some(0.45));
+        assert_eq!(ws.ask_history.len(), 1, "mixed-token series must be dropped");
+        assert_eq!(ws.ask_peak_signalled_side, Some(0.30));
+        assert_eq!(ws.ask_peak_any_side, Some(0.60), "any-side peak spans the window");
+        // ...and the shortened series correctly reports no 30s lookback.
+        assert_eq!(ws.ask_at_age(NOW_MS, 30_000), None);
+    }
+
+    #[test]
+    fn ask_history_absent_ask_is_not_recorded() {
+        let mut ws = WindowState::default();
+        ws.observe_ask(NOW_MS - 10_000, Some("Up"), None, None);
+        assert!(ws.ask_history.is_empty());
+        assert_eq!(ws.ask_peak_signalled_side, None);
+        assert_eq!(ws.ask_at_age(NOW_MS, 5_000), None);
+    }
+
+    #[test]
+    fn diagnostics_clear_on_rotation() {
+        let mut ws = WindowState::default();
+        ws.observe_delta_extremes(NOW_MS - 10_000, 0.15);
+        ws.observe_ask(NOW_MS - 10_000, Some("Up"), Some(0.5), Some(0.5));
+        ws.push_delta(NOW_MS, 0.1);
+
+        // Mirrors the rotation reset in main.rs.
+        ws.delta_history.clear();
+        ws.delta_peak_abs = None;
+        ws.delta_peak_ms = None;
+        ws.delta_first_cross_ms = None;
+        ws.ask_peak_signalled_side = None;
+        ws.ask_peak_any_side = None;
+        ws.ask_history.clear();
+        ws.last_signalled_side = None;
+
+        assert_eq!(ws.delta_peak_abs, None);
+        assert_eq!(ws.delta_rise_time_s(), None);
+        assert_eq!(ws.delta_peak_secs_ago(NOW_MS), None);
+        assert_eq!(ws.ask_at_age(NOW_MS, 5_000), None);
+        assert_eq!(ws.delta_at_age(NOW_MS, 5_000), None);
     }
 
     #[test]

@@ -41,6 +41,9 @@ pub const DELTA_HISTORY_WINDOW_MS: i64 = 45_000;
 /// reading and always look flat.
 pub const DELTA_MOMENTUM_MIN_AGE_MS: i64 = 20_000;
 
+/// Floor for "the move has started", used to measure rise time.
+pub const DELTA_RISE_FLOOR_PCT: f64 = 0.02;
+
 /// Defensive cap on delta history length. At a 250ms tick the 45s window holds
 /// ~180 entries; this only bounds growth if a window somehow stalls.
 pub const DELTA_HISTORY_MAX_ENTRIES: usize = 1200;

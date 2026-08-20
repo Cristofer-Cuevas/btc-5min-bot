@@ -298,7 +298,7 @@ impl Database {
         // Binance values are REAL (the feed publishes floats); Chainlink values
         // stay TEXT holding raw E18, so the two representations never share a
         // column.
-        let binance_twap_cols: [(&str, &str, &str); 21] = [
+        let binance_twap_cols: [(&str, &str, &str); 32] = [
             ("signals", "binance_twap_delta_pct", "REAL"),
             ("signals", "binance_twap_value", "REAL"),
             ("signals", "binance_twap_strike", "REAL"),
@@ -327,6 +327,23 @@ impl Database {
             ("signals", "delta_past_value", "REAL"),
             ("signals", "delta_past_age_ms", "INTEGER"),
             ("trades", "delta_momentum_at_entry", "REAL"),
+            // Entry-pattern diagnostics, written on every signal including
+            // rejections so they can be scored against actual_resolution.
+            ("signals", "delta_peak_abs", "REAL"),
+            ("signals", "delta_peak_secs_ago", "REAL"),
+            ("signals", "delta_rise_time_s", "REAL"),
+            ("signals", "delta_5s_ago", "REAL"),
+            ("signals", "delta_15s_ago", "REAL"),
+            ("signals", "delta_30s_ago", "REAL"),
+            ("signals", "ask_5s_ago", "REAL"),
+            ("signals", "ask_30s_ago", "REAL"),
+            ("signals", "ask_peak_signalled", "REAL"),
+            ("signals", "ask_peak_any", "REAL"),
+            // The delta that actually drove the threshold and side selection,
+            // respecting use_twap_strike. btc_delta_pct and twap_delta_pct are
+            // both kept alongside it: in spot mode both are populated, so which
+            // one decided cannot be reconstructed from them after the fact.
+            ("signals", "decision_delta", "REAL"),
         ];
         for (table, name, ty) in &binance_twap_cols {
             if !column_exists(&conn, table, name) {
@@ -689,10 +706,16 @@ impl Database {
                 binance_buffer_span_ms, binance_buffer_samples,
                 chainlink_twap_observed_ms, signal_evaluated_at_ms,
                 binance_newest_sample_ms,
-                delta_momentum, delta_past_value, delta_past_age_ms
+                delta_momentum, delta_past_value, delta_past_age_ms,
+                delta_peak_abs, delta_peak_secs_ago, delta_rise_time_s,
+                delta_5s_ago, delta_15s_ago, delta_30s_ago,
+                ask_5s_ago, ask_30s_ago, ask_peak_signalled, ask_peak_any,
+                decision_delta
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                        ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                       ?26, ?27, ?28)",
+                       ?26, ?27, ?28,
+                       ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38,
+                       ?39)",
             params![
                 now_ms,
                 window_ts,
@@ -724,6 +747,17 @@ impl Database {
                 eval.delta_momentum,
                 eval.delta_past_value,
                 eval.delta_past_age_ms,
+                ctx.delta_peak_abs,
+                ctx.delta_peak_secs_ago,
+                ctx.delta_rise_time_s,
+                ctx.delta_5s_ago,
+                ctx.delta_15s_ago,
+                ctx.delta_30s_ago,
+                ctx.ask_5s_ago,
+                ctx.ask_30s_ago,
+                ctx.ask_peak_signalled,
+                ctx.ask_peak_any,
+                eval.decision_delta,
             ],
         ) {
             error!("Failed to insert signal: {}", e);

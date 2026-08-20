@@ -604,6 +604,61 @@ mod strike_mode_tests {
         assert!(spot.delta_momentum.unwrap() > 1.0);
     }
 
+    /// The diagnostic fields are pure observation: a WindowState carrying a
+    /// full set of populated extremes and histories must produce exactly the
+    /// same evaluation as an empty one. Mirrors the shadow-invariance tests.
+    #[test]
+    fn diagnostic_fields_never_affect_the_decision() {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // Populated: peak, first cross, ask series and peaks, all set to values
+        // that would look alarming if anything read them.
+        let mut populated = WindowState::default();
+        populated.observe_delta_extremes(now - 40_000, 0.90);
+        populated.observe_delta_extremes(now - 10_000, -0.85);
+        populated.observe_ask(now - 30_000, Some("Down"), Some(0.98), Some(0.99));
+        populated.observe_ask(now - 5_000, Some("Up"), Some(0.97), Some(0.99));
+
+        for flag in [false, true] {
+            for secs in [60, 100] {
+                let (ms, win) = market();
+                let bare = evaluate_entry(
+                    &cfg_momentum(flag, 0.0),
+                    &btc_rtds_agrees(),
+                    &binance_up_trending(),
+                    &ms,
+                    &win,
+                    secs,
+                    Some(STRIKE),
+                    None,
+                    &WindowState::default(),
+                );
+                let rich = evaluate_entry(
+                    &cfg_momentum(flag, 0.0),
+                    &btc_rtds_agrees(),
+                    &binance_up_trending(),
+                    &ms,
+                    &win,
+                    secs,
+                    Some(STRIKE),
+                    None,
+                    &populated,
+                );
+
+                assert_eq!(
+                    bare.rejection_reason, rich.rejection_reason,
+                    "diagnostics changed the rejection reason (flag={flag}, secs={secs})"
+                );
+                assert_eq!(bare.side, rich.side, "diagnostics changed side selection");
+                assert_eq!(bare.decision_delta, rich.decision_delta);
+                assert_eq!(bare.btc_delta_pct, rich.btc_delta_pct);
+                assert_eq!(bare.twap_delta_pct, rich.twap_delta_pct);
+                assert_eq!(bare.ask_price, rich.ask_price);
+                assert_eq!(bare.signal.is_some(), rich.signal.is_some());
+            }
+        }
+    }
+
     /// Guard: the fixture really does clear the trend gate, otherwise the two
     /// tests below would pass for the wrong reason.
     #[test]

@@ -76,6 +76,21 @@ async fn build_signal_context(
         let ws = window_state.read().await;
         ctx.chainlink_twap_strike = ws.twap_strike.clone();
         ctx.binance_twap_strike = ws.binance_twap_strike;
+
+        // Entry-pattern diagnostics. The current evaluation has already been
+        // observed into the window state by this point, so a signal sitting at
+        // the peak correctly reports delta_peak_secs_ago = 0.
+        let now = ctx.signal_evaluated_at_ms;
+        ctx.delta_peak_abs = ws.delta_peak_abs;
+        ctx.delta_peak_secs_ago = ws.delta_peak_secs_ago(now);
+        ctx.delta_rise_time_s = ws.delta_rise_time_s();
+        ctx.delta_5s_ago = ws.delta_at_age(now, 5_000);
+        ctx.delta_15s_ago = ws.delta_at_age(now, 15_000);
+        ctx.delta_30s_ago = ws.delta_at_age(now, 30_000);
+        ctx.ask_5s_ago = ws.ask_at_age(now, 5_000);
+        ctx.ask_30s_ago = ws.ask_at_age(now, 30_000);
+        ctx.ask_peak_signalled = ws.ask_peak_signalled_side;
+        ctx.ask_peak_any = ws.ask_peak_any_side;
     }
 
     ctx.binance_twap_delta_pct = match (ctx.binance_twap_strike, ctx.binance_twap_value) {
@@ -386,6 +401,15 @@ async fn main() {
                 // Momentum is measured within a window only — a delta from the
                 // previous window would compare across a strike reset.
                 ws.delta_history.clear();
+                // Per-window diagnostics: extremes and the ask series describe
+                // one window's tokens and must not leak into the next.
+                ws.delta_peak_abs = None;
+                ws.delta_peak_ms = None;
+                ws.delta_first_cross_ms = None;
+                ws.ask_peak_signalled_side = None;
+                ws.ask_peak_any_side = None;
+                ws.ask_history.clear();
+                ws.last_signalled_side = None;
             }
 
             // Reset market state. MarketState is shared across windows and
@@ -743,11 +767,30 @@ async fn main() {
         // evaluation that read the history, so a reading never compares against
         // itself. Nothing is pushed when no decision delta was produced (early
         // rejections, or a stale TWAP in twap mode).
-        if let Some(d) = eval_result.decision_delta {
-            window_state
-                .write()
-                .await
-                .push_delta(chrono::Utc::now().timestamp_millis(), d);
+        // DATA COLLECTION ONLY: record this evaluation's delta and asks into
+        // the window's running series. Reads nothing back into the decision.
+        {
+            let obs_ms = chrono::Utc::now().timestamp_millis();
+            // Best ask across BOTH sides, so the any-side peak survives a flip.
+            let any_ask = {
+                let ms = market_state.read().await;
+                match (ms.up_book.best_ask, ms.down_book.best_ask) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                }
+            };
+            let mut ws = window_state.write().await;
+            if let Some(d) = eval_result.decision_delta {
+                ws.push_delta(obs_ms, d);
+                ws.observe_delta_extremes(obs_ms, d);
+            }
+            ws.observe_ask(
+                obs_ms,
+                eval_result.side.as_deref(),
+                eval_result.ask_price,
+                any_ask,
+            );
         }
 
         // Signal logging: skip plumbing-noise reasons entirely, always write
