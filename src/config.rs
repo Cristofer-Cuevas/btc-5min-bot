@@ -40,6 +40,28 @@ pub struct RuntimeConfig {
     pub db_path: String,
     pub dry_run: bool,
 
+    /// How often to log a `signals` row while the rejection reason is
+    /// unchanged, in milliseconds. 0 disables the cadence, restoring the
+    /// original change-only logging.
+    ///
+    /// Without a cadence the table records only transition moments, which
+    /// leaves the fair-value fit with no data in any region the evaluation sits
+    /// in quietly -- above all the near-zero deltas a market maker cares most
+    /// about.
+    pub signal_log_cadence_ms: i64,
+
+    // ── Maker (Phase 2: shadow quoting, MEASUREMENT ONLY) ──
+    /// Off by default. `shadow` computes and records the quotes the bot would
+    /// have posted; it never sends an order. `live` is rejected outright —
+    /// see [`crate::maker::MakerMode::parse`].
+    pub maker_mode: crate::maker::MakerMode,
+    /// Path to the fair-value curve fitted by `tools/build_fairvalue.py`.
+    /// Required (and validated) whenever `maker_mode` is not Off.
+    pub fairvalue_path: String,
+    /// Half-width of the quoted spread around fair value. Deliberately wide:
+    /// order placement is 400-1400ms, so tightness cannot be defended.
+    pub maker_half_spread: f64,
+
     /// When true, the entry threshold and side selection use the TWAP-based
     /// delta (strike = TWAP at window open) instead of the Binance spot delta.
     ///
@@ -186,6 +208,68 @@ impl RuntimeConfig {
             tracing::info!("USE_TWAP_STRIKE=false (shadow mode): TWAP delta logged, spot delta decides");
         }
 
+        // ── Maker configuration ──
+        let signal_log_cadence_ms: i64 = {
+            let raw: i64 = env::var("SIGNAL_LOG_CADENCE_MS")
+                .unwrap_or_else(|_| "5000".into())
+                .parse()
+                .unwrap_or(5000);
+            // Below one loop tick (250ms) the cadence would fire every
+            // iteration. 0 is a valid value meaning "disabled", so it is
+            // allowed through explicitly rather than caught by the range.
+            if raw == 0 || (250..=60_000).contains(&raw) {
+                raw
+            } else {
+                tracing::warn!(
+                    "SIGNAL_LOG_CADENCE_MS {} outside [250, 60000] (0 = off);                      clamping to default 5000",
+                    raw
+                );
+                5000
+            }
+        };
+        if signal_log_cadence_ms > 0 {
+            tracing::info!(
+                "SIGNAL_LOG_CADENCE_MS={} - signals written on reason change AND every                  {}ms while a decision delta exists",
+                signal_log_cadence_ms,
+                signal_log_cadence_ms
+            );
+        } else {
+            tracing::info!("SIGNAL_LOG_CADENCE_MS=0 - signals logged on reason change only");
+        }
+
+        let maker_mode = crate::maker::MakerMode::parse(
+            &env::var("MAKER_MODE").unwrap_or_default(),
+        )?;
+
+        let fairvalue_path = env::var("FAIRVALUE_PATH")
+            .unwrap_or_else(|_| "/etc/btc-5min-bot/fairvalue.json".into());
+
+        let maker_half_spread = {
+            let raw: f64 = env::var("MAKER_HALF_SPREAD")
+                .unwrap_or_else(|_| "0.04".into())
+                .parse()
+                .unwrap_or(0.04);
+            // A half-spread at or below one tick is not a maker strategy, and
+            // above 0.25 the quotes leave the tradeable band entirely.
+            if (0.01..=0.25).contains(&raw) {
+                raw
+            } else {
+                tracing::warn!(
+                    "MAKER_HALF_SPREAD {:.4} outside [0.01, 0.25]; clamping to default 0.04",
+                    raw
+                );
+                0.04
+            }
+        };
+
+        if maker_mode != crate::maker::MakerMode::Off {
+            tracing::info!(
+                "MAKER_MODE={} — shadow quoting active. NO orders are placed or \
+                 cancelled; the taker path is unchanged.",
+                maker_mode.as_str()
+            );
+        }
+
         if !dry_run && poly_proxy_address.is_empty() {
             return Err("POLY_PROXY_ADDRESS is required when DRY_RUN=false".to_string());
         }
@@ -238,6 +322,10 @@ impl RuntimeConfig {
             db_path,
             dry_run,
             use_twap_strike,
+            signal_log_cadence_ms,
+            maker_mode,
+            fairvalue_path,
+            maker_half_spread,
             chainlink_api_key,
             chainlink_api_secret,
             chainlink_stream_id,

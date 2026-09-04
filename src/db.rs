@@ -233,6 +233,40 @@ impl Database {
                 expected_down_token         TEXT
             );
 
+            -- PHASE 2 SHADOW QUOTING — MEASUREMENT ONLY.
+            -- Nothing that writes this table sends an order. Each row is the
+            -- quote the bot WOULD have posted for one side at one instant,
+            -- plus the book at that instant, plus (filled in at resolution)
+            -- whether a simulated fill landed on the winning side.
+            --
+            -- fill_was_correct is defined ONLY for rows where would_bid_fill=1:
+            -- a bid fill BUYS the side, so correct means that side won. It
+            -- is NULL where no bid fill was simulated. Ask-fill correctness is
+            -- derivable in SQL from side vs actual_resolution and is left out
+            -- rather than overloading one column with two meanings.
+            CREATE TABLE IF NOT EXISTS maker_shadow (
+                window_ts           INTEGER NOT NULL,
+                timestamp_ms        INTEGER NOT NULL,
+                secs_left           INTEGER,
+                side                TEXT NOT NULL,
+                decision_delta      REAL,
+                fair_value          REAL,
+                our_bid             REAL,
+                our_ask             REAL,
+                market_bid          REAL,
+                market_ask          REAL,
+                would_bid_fill      INTEGER,
+                would_ask_fill      INTEGER,
+                actual_resolution   TEXT,
+                fill_was_correct    INTEGER,
+                PRIMARY KEY (window_ts, timestamp_ms, side)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_maker_shadow_window
+                ON maker_shadow(window_ts);
+            CREATE INDEX IF NOT EXISTS idx_maker_shadow_ts
+                ON maker_shadow(timestamp_ms);
+
             CREATE INDEX IF NOT EXISTS idx_trades_window ON trades(window_ts);
             CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
             CREATE INDEX IF NOT EXISTS idx_signals_window ON signals(window_ts);
@@ -387,6 +421,34 @@ impl Database {
                 );
                 if let Err(e) = conn.execute(&sql, []) {
                     error!("Failed to add twap_observations column {}: {}", name, e);
+                }
+            }
+        }
+
+        // maker_shadow columns, pragma-guarded like every other migration so a
+        // table created by an earlier build is widened in place rather than
+        // dropped. Additive and NULL-defaulted throughout.
+        let maker_shadow_cols: [(&str, &str); 12] = [
+            ("secs_left", "INTEGER"),
+            ("decision_delta", "REAL"),
+            ("fair_value", "REAL"),
+            ("our_bid", "REAL"),
+            ("our_ask", "REAL"),
+            ("market_bid", "REAL"),
+            ("market_ask", "REAL"),
+            ("would_bid_fill", "INTEGER"),
+            ("would_ask_fill", "INTEGER"),
+            ("actual_resolution", "TEXT"),
+            ("fill_was_correct", "INTEGER"),
+            // Reserved so Phase 3 can record a real skew without a schema
+            // change; written as 0.0 in shadow mode.
+            ("inventory_skew", "REAL"),
+        ];
+        for (name, ty) in &maker_shadow_cols {
+            if !column_exists(&conn, "maker_shadow", name) {
+                let sql = format!("ALTER TABLE maker_shadow ADD COLUMN {} {}", name, ty);
+                if let Err(e) = conn.execute(&sql, []) {
+                    error!("Failed to add maker_shadow column {}: {}", name, e);
                 }
             }
         }
@@ -961,4 +1023,445 @@ impl Database {
         count
     }
 
+    // ── PHASE 2 SHADOW QUOTING (measurement only) ──
+
+    /// Record one simulated quote. `INSERT OR REPLACE` because the primary key
+    /// is (window_ts, timestamp_ms, side) and a same-millisecond retry should
+    /// overwrite rather than error.
+    ///
+    /// Failures are logged and swallowed: this is a measurement side-channel
+    /// and must never be able to disturb the trading loop.
+    pub fn insert_maker_shadow(
+        &self,
+        window_ts: i64,
+        timestamp_ms: i64,
+        q: &crate::maker::ShadowQuote,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = conn.execute(
+            "INSERT OR REPLACE INTO maker_shadow (
+                window_ts, timestamp_ms, secs_left, side, decision_delta,
+                fair_value, our_bid, our_ask, market_bid, market_ask,
+                would_bid_fill, would_ask_fill, inventory_skew
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                window_ts,
+                timestamp_ms,
+                q.secs_left,
+                q.side.as_str(),
+                q.decision_delta,
+                q.fair_value,
+                q.our_bid,
+                q.our_ask,
+                q.market_bid,
+                q.market_ask,
+                q.would_bid_fill as i32,
+                q.would_ask_fill as i32,
+                // Phase 2 carries no inventory; the column is reserved.
+                0.0_f64,
+            ],
+        ) {
+            error!("Failed to insert maker_shadow row: {}", e);
+        }
+    }
+
+    /// Label every shadow row of a resolved window with the settled outcome.
+    ///
+    /// THE KEY MEASUREMENT. `fill_was_correct` is set only where a bid fill was
+    /// simulated: buying that side was right exactly when that side won. Rows
+    /// with no simulated bid fill keep NULL, so the adverse-selection rate is a
+    /// plain AVG over the non-NULL values.
+    ///
+    /// Returns the number of rows updated.
+    pub fn resolve_maker_shadow(&self, window_ts: i64, resolution: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        match conn.execute(
+            "UPDATE maker_shadow
+                SET actual_resolution = ?1,
+                    fill_was_correct = CASE
+                        WHEN would_bid_fill = 1
+                        THEN CASE WHEN side = ?1 THEN 1 ELSE 0 END
+                        ELSE NULL
+                    END
+              WHERE window_ts = ?2 AND actual_resolution IS NULL",
+            params![resolution, window_ts],
+        ) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                error!("Failed to resolve maker_shadow rows: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Adverse-selection summary over the most recent `n` RESOLVED shadow rows.
+    ///
+    /// Unresolved rows are excluded: a fill with no outcome yet cannot be
+    /// scored, and counting it would drag every rate toward zero.
+    pub fn maker_shadow_summary(&self, n: i64) -> MakerShadowSummary {
+        let conn = self.conn.lock().unwrap();
+        let sql = "
+            WITH recent AS (
+                SELECT * FROM maker_shadow
+                 WHERE actual_resolution IS NOT NULL
+                 ORDER BY timestamp_ms DESC LIMIT ?1
+            )
+            SELECT
+                COUNT(*),
+                SUM(would_bid_fill),
+                SUM(CASE WHEN would_bid_fill = 1 AND side = actual_resolution
+                         THEN 1 ELSE 0 END),
+                SUM(would_ask_fill),
+                SUM(CASE WHEN would_ask_fill = 1 AND side = actual_resolution
+                         THEN 1 ELSE 0 END),
+                AVG(CASE WHEN market_bid IS NOT NULL AND market_ask IS NOT NULL
+                         THEN ABS(fair_value - (market_bid + market_ask) / 2.0)
+                         END),
+                MIN(timestamp_ms),
+                MAX(timestamp_ms)
+            FROM recent";
+        conn.query_row(sql, params![n], |row| {
+            Ok(MakerShadowSummary {
+                rows: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                bid_fills: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                bid_fills_on_winner: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                ask_fills: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                ask_fills_on_winner: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                mean_abs_fv_minus_mid: row.get(5)?,
+                first_ts_ms: row.get(6)?,
+                last_ts_ms: row.get(7)?,
+            })
+        })
+        .unwrap_or_default()
+    }
+
+    /// Shadow rows still awaiting a resolution label, for /maker.
+    pub fn maker_shadow_pending(&self) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM maker_shadow WHERE actual_resolution IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+}
+
+/// Aggregates behind the `/maker` Telegram report.
+#[derive(Debug, Clone, Default)]
+pub struct MakerShadowSummary {
+    pub rows: i64,
+    pub bid_fills: i64,
+    /// Of the simulated bid fills, how many bought the side that won.
+    pub bid_fills_on_winner: i64,
+    pub ask_fills: i64,
+    /// Of the simulated ask fills, how many SOLD the side that won -- i.e. how
+    /// often selling was the wrong side of the trade.
+    pub ask_fills_on_winner: i64,
+    /// Mean |fair_value - market mid| over rows where both book sides existed.
+    pub mean_abs_fv_minus_mid: Option<f64>,
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::fairvalue::Side;
+    use crate::maker::ShadowQuote;
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "btc5min-migration-{}-{}.db",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A database as it existed BEFORE this change: the original `trades` and
+    /// `signals` shapes, with rows in them. Running `Database::new` over this
+    /// must widen it without losing anything.
+    fn legacy_db(path: &std::path::Path) {
+        let conn = Connection::open(path).expect("open legacy");
+        conn.execute_batch(
+            "CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                window_ts INTEGER NOT NULL,
+                slug TEXT NOT NULL,
+                side TEXT NOT NULL,
+                btc_delta_pct REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                shares REAL NOT NULL,
+                cost_usdc REAL NOT NULL,
+                secs_left INTEGER NOT NULL,
+                resolution TEXT,
+                won INTEGER,
+                payout REAL,
+                profit REAL,
+                resolved_at INTEGER,
+                order_id TEXT,
+                dry_run INTEGER DEFAULT 0
+             );
+             CREATE TABLE signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms INTEGER NOT NULL,
+                window_ts INTEGER NOT NULL,
+                secs_left INTEGER NOT NULL,
+                btc_delta_pct REAL,
+                ask_price REAL,
+                bid_price REAL,
+                spread REAL,
+                ask_depth REAL,
+                trade_count INTEGER,
+                trend_strength REAL,
+                side TEXT,
+                rejection_reason TEXT NOT NULL,
+                dry_run INTEGER NOT NULL
+             );
+             INSERT INTO trades (timestamp, window_ts, slug, side, btc_delta_pct,
+                                 entry_price, shares, cost_usdc, secs_left,
+                                 resolution, won, payout, profit, dry_run)
+             VALUES (1, 300, 'w-300', 'Up', 0.09, 0.62, 5, 3.1, 90,
+                     'Up', 1, 5.0, 1.9, 0),
+                    (2, 600, 'w-600', 'Down', -0.11, 0.55, 5, 2.75, 60,
+                     'Up', 0, 0.0, -2.75, 0);
+             INSERT INTO signals (timestamp_ms, window_ts, secs_left,
+                                  btc_delta_pct, rejection_reason, dry_run)
+             VALUES (1000, 300, 90, 0.09, 'entered', 0),
+                    (2000, 300, 80, 0.05, 'below_threshold', 0),
+                    (3000, 600, 60, -0.11, 'entered', 0);",
+        )
+        .expect("seed legacy");
+    }
+
+    fn count(db: &Database, table: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
+            .unwrap_or(-1)
+    }
+
+    /// The migration must be purely additive: existing rows survive untouched
+    /// and the new table appears.
+    #[test]
+    fn migration_is_additive_on_a_legacy_schema() {
+        let path = tmp_path("legacy");
+        legacy_db(&path);
+
+        let db = Database::new(path.to_str().unwrap()).expect("migrate");
+
+        assert_eq!(count(&db, "trades"), 2, "trades rows were lost");
+        assert_eq!(count(&db, "signals"), 3, "signals rows were lost");
+        assert_eq!(count(&db, "maker_shadow"), 0, "maker_shadow should start empty");
+
+        // The values in the pre-existing rows are unchanged.
+        {
+            let conn = db.conn.lock().unwrap();
+            let (side, profit): (String, f64) = conn
+                .query_row(
+                    "SELECT side, profit FROM trades WHERE window_ts = 300",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("legacy trade still readable");
+            assert_eq!(side, "Up");
+            assert!((profit - 1.9).abs() < 1e-9);
+        }
+
+        // And the columns this change depends on now exist.
+        {
+            let conn = db.conn.lock().unwrap();
+            assert!(column_exists(&conn, "signals", "decision_delta"));
+            assert!(column_exists(&conn, "maker_shadow", "fill_was_correct"));
+            assert!(column_exists(&conn, "maker_shadow", "inventory_skew"));
+        }
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Re-running init over an already-migrated database is a no-op, so a
+    /// restart never re-ALTERs or duplicates anything.
+    #[test]
+    fn migration_is_idempotent() {
+        let path = tmp_path("idempotent");
+        legacy_db(&path);
+
+        let db = Database::new(path.to_str().unwrap()).expect("first migrate");
+        drop(db);
+        let db = Database::new(path.to_str().unwrap()).expect("second migrate");
+        let db2 = Database::new(path.to_str().unwrap()).expect("third migrate");
+
+        assert_eq!(count(&db, "trades"), 2);
+        assert_eq!(count(&db, "signals"), 3);
+        assert_eq!(count(&db2, "maker_shadow"), 0);
+
+        drop(db);
+        drop(db2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn quote(side: Side, bid_fill: bool) -> ShadowQuote {
+        ShadowQuote {
+            side,
+            decision_delta: 0.08,
+            secs_left: 90,
+            fair_value: 0.60,
+            our_bid: 0.56,
+            our_ask: 0.64,
+            market_bid: Some(0.55),
+            market_ask: if bid_fill { Some(0.56) } else { Some(0.60) },
+            would_bid_fill: bid_fill,
+            would_ask_fill: false,
+        }
+    }
+
+    /// THE KEY MEASUREMENT, end to end: a simulated bid fill on the side that
+    /// wins scores 1, one on the side that loses scores 0, and a row with no
+    /// simulated fill is left unscored rather than counted as a miss.
+    #[test]
+    fn resolution_scores_bid_fills_against_the_actual_outcome() {
+        let path = tmp_path("scoring");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        // Up filled, Down filled, and an Up row with no fill.
+        db.insert_maker_shadow(300, 1_000, &quote(Side::Up, true));
+        db.insert_maker_shadow(300, 1_001, &quote(Side::Down, true));
+        db.insert_maker_shadow(300, 1_002, &quote(Side::Up, false));
+
+        let updated = db.resolve_maker_shadow(300, "Up");
+        assert_eq!(updated, 3, "every row in the window must be labelled");
+
+        let conn_scores = {
+            let conn = db.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT timestamp_ms, fill_was_correct FROM maker_shadow
+                      ORDER BY timestamp_ms",
+                )
+                .unwrap();
+            let rows: Vec<(i64, Option<i64>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        assert_eq!(
+            conn_scores,
+            vec![(1_000, Some(1)), (1_001, Some(0)), (1_002, None)],
+            "bid-fill scoring is wrong"
+        );
+
+        // The summary agrees: two bid fills, one of them on the winner.
+        let s = db.maker_shadow_summary(200);
+        assert_eq!(s.rows, 3);
+        assert_eq!(s.bid_fills, 2);
+        assert_eq!(s.bid_fills_on_winner, 1);
+        assert_eq!(db.maker_shadow_pending(), 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Resolution must not relabel a window that already settled.
+    #[test]
+    fn resolution_does_not_relabel_already_resolved_rows() {
+        let path = tmp_path("relabel");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        db.insert_maker_shadow(300, 1_000, &quote(Side::Up, true));
+        assert_eq!(db.resolve_maker_shadow(300, "Up"), 1);
+        // A second, contradictory resolution for the same window changes nothing.
+        assert_eq!(db.resolve_maker_shadow(300, "Down"), 0);
+
+        let s = db.maker_shadow_summary(200);
+        assert_eq!(s.bid_fills_on_winner, 1, "row was relabelled");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Unresolved rows are excluded from the summary: a fill with no outcome
+    /// cannot be scored, and counting it would drag every rate toward zero.
+    #[test]
+    fn summary_ignores_unresolved_rows() {
+        let path = tmp_path("pending");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        db.insert_maker_shadow(300, 1_000, &quote(Side::Up, true));
+        db.insert_maker_shadow(600, 2_000, &quote(Side::Up, true));
+        db.resolve_maker_shadow(300, "Up");
+
+        let s = db.maker_shadow_summary(200);
+        assert_eq!(s.rows, 1, "unresolved row leaked into the summary");
+        assert_eq!(s.bid_fills, 1);
+        assert_eq!(db.maker_shadow_pending(), 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An empty table must not panic or report bogus aggregates.
+    #[test]
+    fn summary_on_an_empty_table_is_all_zeroes() {
+        let path = tmp_path("empty");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+        let s = db.maker_shadow_summary(200);
+        assert_eq!(s.rows, 0);
+        assert_eq!(s.bid_fills, 0);
+        assert_eq!(s.mean_abs_fv_minus_mid, None);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Manual check against a COPY of the production database. Ignored by
+    /// default because it needs a real file; run it before deploying:
+    ///
+    ///   LIVE_DB_COPY=/path/to/copy-of-trades.db cargo test -- --ignored
+    ///
+    /// It asserts nothing about specific counts (they grow); it prints them and
+    /// verifies the migration did not destroy rows or leave the schema short.
+    #[test]
+    #[ignore = "needs LIVE_DB_COPY pointing at a copy of the production database"]
+    fn migration_preserves_a_live_database_copy() {
+        let path = match std::env::var("LIVE_DB_COPY") {
+            Ok(p) => p,
+            Err(_) => panic!("set LIVE_DB_COPY to a COPY of the production database"),
+        };
+
+        // Counts BEFORE the migration runs.
+        let before: Vec<(String, i64)> = {
+            let conn = Connection::open(&path).expect("open copy");
+            ["trades", "signals", "twap_observations", "daily_stats"]
+                .iter()
+                .map(|t| {
+                    let n: i64 = conn
+                        .query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0))
+                        .unwrap_or(-1);
+                    ((*t).to_string(), n)
+                })
+                .collect()
+        };
+
+        let db = Database::new(&path).expect("migrate live copy");
+
+        for (table, n_before) in &before {
+            let n_after = count(&db, table);
+            println!("{:<20} before={} after={}", table, n_before, n_after);
+            assert_eq!(
+                *n_before, n_after,
+                "migration changed the row count of {}",
+                table
+            );
+        }
+        println!("{:<20} after={}", "maker_shadow", count(&db, "maker_shadow"));
+
+        let conn = db.conn.lock().unwrap();
+        assert!(column_exists(&conn, "maker_shadow", "fill_was_correct"));
+        assert!(column_exists(&conn, "signals", "decision_delta"));
+    }
 }

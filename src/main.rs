@@ -3,6 +3,8 @@ mod config;
 mod constants;
 mod db;
 mod discovery;
+mod fairvalue;
+mod maker;
 mod market_ws;
 mod rtds;
 mod strategy;
@@ -191,6 +193,38 @@ async fn main() {
         }
     };
 
+    // ── 3b. Fair-value model (maker modes only) ──
+    // Loaded BEFORE any shared state or feed is spawned so a bad curve fails
+    // fast and visibly. There is deliberately no fallback: quoting against a
+    // guessed curve is worse than not quoting.
+    {
+        let cfg_ref = &cfg;
+        if cfg_ref.maker_mode != maker::MakerMode::Off {
+            match fairvalue::init(&cfg_ref.fairvalue_path) {
+                Ok(()) => info!(
+                    "Maker mode '{}' armed (SHADOW ONLY — no orders are sent)",
+                    cfg_ref.maker_mode.as_str()
+                ),
+                Err(e) => {
+                    error!(
+                        "MAKER_MODE={} but the fair-value model could not be loaded: {}",
+                        cfg_ref.maker_mode.as_str(),
+                        e
+                    );
+                    error!(
+                        "Refusing to start in maker mode without a validated curve. \
+                         Rebuild it with: python tools/build_fairvalue.py \
+                         --db <trades.db> --out {}",
+                        cfg_ref.fairvalue_path
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            info!("MAKER_MODE=off — no fair-value model loaded, no shadow rows written");
+        }
+    }
+
     // ── 4. Shared state ──
     let shared_config = cfg.into_shared();
     let btc_price: SharedBtcPrice = Arc::new(RwLock::new(BtcPriceState::default()));
@@ -301,6 +335,15 @@ async fn main() {
     // ── 13. Main loop: window rotation + strategy evaluation ──
     let mut last_window_ts: u64 = 0;
 
+    // Fixed for the process lifetime — deliberately NOT settable via Telegram,
+    // so shadow measurement cannot be switched on or off mid-run and split a
+    // dataset across two configurations.
+    let maker_mode = shared_config.read().await.maker_mode;
+
+    // Also fixed for the process lifetime: changing the sampling cadence
+    // mid-run would splice two different sampling regimes into one dataset.
+    let signal_log_cadence_ms = shared_config.read().await.signal_log_cadence_ms;
+
     info!("Entering main trading loop");
 
     loop {
@@ -410,6 +453,14 @@ async fn main() {
                 ws.ask_peak_any_side = None;
                 ws.ask_history.clear();
                 ws.last_signalled_side = None;
+                // SHADOW ONLY: a new window should record its first tick
+                // immediately rather than waiting out the previous window's
+                // throttle.
+                ws.maker_shadow_last_write_ms.clear();
+                // Same reasoning for the signal cadence: a new window should
+                // log its first qualifying evaluation without waiting out the
+                // previous window's interval.
+                ws.last_signal_write_ms = None;
             }
 
             // Reset market state. MarketState is shared across windows and
@@ -793,8 +844,87 @@ async fn main() {
             );
         }
 
-        // Signal logging: skip plumbing-noise reasons entirely, always write
-        // "entered", otherwise write only when rejection reason changes.
+        // ── PHASE 2: SHADOW QUOTING (MEASUREMENT ONLY) ──
+        //
+        // Computes the quotes the bot WOULD have posted for the signalled side
+        // and records them against the book at this instant. NOTHING is sent to
+        // Polymarket here: there is no order build, no signing, no HTTP call.
+        // Every value it reads is already-computed state, and it writes only to
+        // `maker_shadow`. Runs AFTER the evaluation and the delta-history
+        // update above so it cannot influence either.
+        if maker_mode != maker::MakerMode::Off {
+            // Every input is read-only. `decision_delta` and `side` come from
+            // the evaluation that already happened; no gate consults the result.
+            if let (Some(delta), Some(side_str)) =
+                (eval_result.decision_delta, eval_result.side.as_deref())
+            {
+                if let Some(side) = fairvalue::Side::parse(side_str) {
+                    let tick = {
+                        let ws = window_state.read().await;
+                        ws.market.as_ref().and_then(|m| maker::parse_tick(&m.tick_size))
+                    };
+
+                    // A missing or unparseable tick means we cannot say where a
+                    // quote would legally rest, so the tick is skipped rather
+                    // than assuming 0.01.
+                    if let Some(tick) = tick {
+                        let maker_half_spread = shared_config.read().await.maker_half_spread;
+                        let (market_bid, market_ask) = {
+                            let ms = market_state.read().await;
+                            let book = if side == fairvalue::Side::Up {
+                                &ms.up_book
+                            } else {
+                                &ms.down_book
+                            };
+                            (book.best_bid, book.best_ask)
+                        };
+
+                        let quote = maker::shadow_quote(
+                            side,
+                            delta,
+                            secs_left,
+                            maker_half_spread,
+                            // Phase 2 carries no inventory, so no skew.
+                            0.0,
+                            tick,
+                            market_bid,
+                            market_ask,
+                        );
+
+                        if let Some(q) = quote {
+                            // At most one row per second per side, so the table
+                            // stays queryable at a 250ms tick.
+                            let should_write = {
+                                let ws = window_state.read().await;
+                                match ws.maker_shadow_last_write_ms.get(side.as_str()) {
+                                    Some(last) => {
+                                        now_ms - last >= maker::SHADOW_MIN_WRITE_INTERVAL_MS
+                                    }
+                                    None => true,
+                                }
+                            };
+                            if should_write {
+                                db.insert_maker_shadow(current_ts as i64, now_ms, &q);
+                                let mut ws = window_state.write().await;
+                                ws.maker_shadow_last_write_ms
+                                    .insert(side.as_str().to_string(), now_ms);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Signal logging: skip plumbing-noise reasons entirely, then write on
+        // any of three triggers - "entered", a changed rejection reason, or the
+        // logging cadence. See WindowState::should_write_signal.
+        //
+        // The cadence is what turns this table into a uniform time sample.
+        // Change-only logging recorded roughly 2.5 rows per window, all of them
+        // at moments where the verdict flipped, which left the fair-value fit
+        // with no observations of the long quiet stretches in between - most
+        // damagingly the near-zero deltas, where "below_threshold" is written
+        // once and then never again.
         let reason = eval_result.rejection_reason;
         let skip_noise = matches!(
             reason,
@@ -802,12 +932,17 @@ async fn main() {
         );
 
         if !skip_noise {
-            let should_write = reason == "entered" || {
+            let trigger = {
                 let ws = window_state.read().await;
-                ws.last_signal_reason.as_deref() != Some(reason)
+                ws.should_write_signal(
+                    reason,
+                    eval_result.decision_delta.is_some(),
+                    now_ms,
+                    signal_log_cadence_ms,
+                )
             };
 
-            if should_write {
+            if let Some(trigger) = trigger {
                 // Shadow comparison: how the two models see this signal. Gated
                 // by should_write so it is one line per evaluated signal, not
                 // one per tick.
@@ -848,6 +983,13 @@ async fn main() {
                 );
                 let mut ws = window_state.write().await;
                 ws.last_signal_reason = Some(reason.to_string());
+                ws.last_signal_write_ms = Some(now_ms);
+                drop(ws);
+                tracing::debug!(
+                    "signal logged: reason={} trigger={}",
+                    reason,
+                    trigger.as_str()
+                );
             }
         }
 
@@ -1199,6 +1341,21 @@ async fn main() {
                     &event.winning_asset_id,
                     chrono::Utc::now().timestamp_millis(),
                 );
+
+                // ── PHASE 2: label this window's shadow rows ──
+                // THE KEY MEASUREMENT. Turns each simulated fill into a scored
+                // observation: did the side we would have BOUGHT actually win?
+                // Writes only to `maker_shadow`; touches no trading state.
+                if maker_mode != maker::MakerMode::Off {
+                    let labelled =
+                        db.resolve_maker_shadow(window_ts, &event.winning_outcome);
+                    if labelled > 0 {
+                        info!(
+                            "maker shadow: labelled {} row(s) for window {} as {}",
+                            labelled, window_ts, event.winning_outcome
+                        );
+                    }
+                }
 
                 // If the resolved asset is neither token this bot recorded for
                 // the window, the token→window mapping attributed it wrongly —

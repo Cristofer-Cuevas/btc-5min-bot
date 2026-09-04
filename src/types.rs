@@ -389,6 +389,94 @@ pub struct WindowState {
     pub ask_history: VecDeque<(i64, f64)>,
     /// Which side the last evaluation signalled, used only to detect a flip.
     pub last_signalled_side: Option<String>,
+
+    /// PHASE 2 SHADOW QUOTING, MEASUREMENT ONLY. Last `maker_shadow` write per
+    /// side ("Up"/"Down"), so rows are throttled to one per second per side
+    /// instead of one per 250ms tick. Read and written by nothing else; no
+    /// gate, threshold or ordering decision consults it.
+    ///
+    /// Cleared on rotation so a new window records its first tick immediately.
+    pub maker_shadow_last_write_ms: HashMap<String, i64>,
+
+    /// When the last `signals` row was written this window, for the cadence
+    /// trigger in [`WindowState::should_write_signal`]. Cleared on rotation so
+    /// every window logs its first qualifying evaluation immediately.
+    pub last_signal_write_ms: Option<i64>,
+}
+
+/// Why a `signals` row is being written. Recorded so the fitted curve can be
+/// re-derived from cadence rows alone, without the change-triggered rows that
+/// over-represent transition moments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalTrigger {
+    /// An entry was taken. Always logged.
+    Entered,
+    /// The rejection reason differs from the last one logged. This is the
+    /// original (and only) trigger the bot had.
+    ReasonChange,
+    /// The logging cadence elapsed and the evaluation produced a decision
+    /// delta. This is what makes `signals` a uniform time sample.
+    Cadence,
+}
+
+impl SignalTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignalTrigger::Entered => "entered",
+            SignalTrigger::ReasonChange => "reason_change",
+            SignalTrigger::Cadence => "cadence",
+        }
+    }
+}
+
+impl WindowState {
+    /// Whether to write a `signals` row for this evaluation, and why.
+    ///
+    /// Three triggers, checked in priority order:
+    ///
+    /// 1. `entered` — always logged, unconditionally.
+    /// 2. The rejection reason changed — the bot's original behavior, kept
+    ///    exactly as it was so no previously-logged moment stops being logged.
+    /// 3. The cadence elapsed AND this evaluation produced a decision delta.
+    ///
+    /// Trigger 3 is the addition. Without it the table only holds transition
+    /// moments (~2.5 rows per window), which leaves the fair-value fit blind in
+    /// any region the evaluation passes through without changing its verdict —
+    /// most importantly the near-zero deltas, where `below_threshold` is
+    /// written once and then never again for the rest of the window.
+    ///
+    /// The delta requirement is what keeps the cadence from filling the table
+    /// with rows the model cannot use: `decision_delta` is exactly the column
+    /// the fair-value join requires, and it is None for every evaluation that
+    /// bailed out before computing one.
+    ///
+    /// `cadence_ms <= 0` disables trigger 3, restoring the original behavior
+    /// byte for byte.
+    pub fn should_write_signal(
+        &self,
+        reason: &str,
+        has_decision_delta: bool,
+        now_ms: i64,
+        cadence_ms: i64,
+    ) -> Option<SignalTrigger> {
+        if reason == "entered" {
+            return Some(SignalTrigger::Entered);
+        }
+        if self.last_signal_reason.as_deref() != Some(reason) {
+            return Some(SignalTrigger::ReasonChange);
+        }
+        if cadence_ms > 0 && has_decision_delta {
+            let due = match self.last_signal_write_ms {
+                Some(last) => now_ms.saturating_sub(last) >= cadence_ms,
+                // No row yet this window: log the first qualifying evaluation.
+                None => true,
+            };
+            if due {
+                return Some(SignalTrigger::Cadence);
+            }
+        }
+        None
+    }
 }
 
 /// Value in `hist` nearest to `age_ms` before `now_ms`, or None when the series
@@ -1424,4 +1512,142 @@ pub struct TradingStats {
     pub total_payout: f64,
     pub net_pnl: f64,
     pub win_rate: f64,
+}
+
+#[cfg(test)]
+mod signal_cadence_tests {
+    use super::*;
+
+    const CADENCE: i64 = 5_000;
+
+    fn ws_after(reason: &str, wrote_at_ms: i64) -> WindowState {
+        WindowState {
+            last_signal_reason: Some(reason.to_string()),
+            last_signal_write_ms: Some(wrote_at_ms),
+            ..Default::default()
+        }
+    }
+
+    /// An entry is always logged, regardless of cadence or repetition.
+    #[test]
+    fn entered_always_logs() {
+        let ws = ws_after("entered", 10_000);
+        assert_eq!(
+            ws.should_write_signal("entered", true, 10_001, CADENCE),
+            Some(SignalTrigger::Entered)
+        );
+        // ...even with the cadence disabled.
+        assert_eq!(
+            ws.should_write_signal("entered", false, 10_001, 0),
+            Some(SignalTrigger::Entered)
+        );
+    }
+
+    /// The original trigger still fires the moment the verdict changes.
+    #[test]
+    fn changed_reason_logs_immediately() {
+        let ws = ws_after("below_threshold", 10_000);
+        assert_eq!(
+            ws.should_write_signal("choppy", true, 10_001, CADENCE),
+            Some(SignalTrigger::ReasonChange)
+        );
+    }
+
+    /// THE FIX: a reason that stays the same is logged again once the cadence
+    /// elapses. This is what fills the near-zero delta bands, where
+    /// "below_threshold" used to be written once and then never again.
+    #[test]
+    fn unchanged_reason_logs_again_after_the_cadence() {
+        let ws = ws_after("below_threshold", 10_000);
+        // Too soon.
+        assert_eq!(
+            ws.should_write_signal("below_threshold", true, 14_999, CADENCE),
+            None
+        );
+        // Exactly due.
+        assert_eq!(
+            ws.should_write_signal("below_threshold", true, 15_000, CADENCE),
+            Some(SignalTrigger::Cadence)
+        );
+        // Overdue.
+        assert_eq!(
+            ws.should_write_signal("below_threshold", true, 30_000, CADENCE),
+            Some(SignalTrigger::Cadence)
+        );
+    }
+
+    /// The cadence only fires for evaluations that produced a decision delta —
+    /// that is exactly the column the fair-value join requires, so rows the
+    /// model cannot use are never written.
+    #[test]
+    fn cadence_requires_a_decision_delta() {
+        let ws = ws_after("twap_unavailable", 10_000);
+        assert_eq!(
+            ws.should_write_signal("twap_unavailable", false, 30_000, CADENCE),
+            None
+        );
+        assert_eq!(
+            ws.should_write_signal("twap_unavailable", true, 30_000, CADENCE),
+            Some(SignalTrigger::Cadence)
+        );
+    }
+
+    /// cadence_ms = 0 restores the original change-only behavior exactly.
+    #[test]
+    fn zero_cadence_restores_change_only_logging() {
+        let ws = ws_after("below_threshold", 10_000);
+        for now in [10_001, 15_000, 60_000, 600_000] {
+            assert_eq!(
+                ws.should_write_signal("below_threshold", true, now, 0),
+                None,
+                "cadence fired at {} with the cadence disabled",
+                now
+            );
+        }
+        // A changed reason still logs.
+        assert_eq!(
+            ws.should_write_signal("choppy", true, 10_001, 0),
+            Some(SignalTrigger::ReasonChange)
+        );
+    }
+
+    /// A fresh window (nothing written yet) logs its first qualifying
+    /// evaluation immediately rather than waiting out an interval.
+    #[test]
+    fn first_evaluation_of_a_window_logs_immediately() {
+        let ws = WindowState {
+            last_signal_reason: Some("below_threshold".to_string()),
+            last_signal_write_ms: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            ws.should_write_signal("below_threshold", true, 1, CADENCE),
+            Some(SignalTrigger::Cadence)
+        );
+    }
+
+    /// Rate: at a 250ms loop tick and a 5s cadence, a 300s window yields about
+    /// one row per cadence interval, not one per tick. Guards against the
+    /// change turning into a 20x write amplification.
+    #[test]
+    fn cadence_bounds_the_write_rate() {
+        let mut ws = WindowState {
+            last_signal_reason: Some("below_threshold".to_string()),
+            ..Default::default()
+        };
+        let mut writes = 0;
+        let mut now = 0i64;
+        while now < 300_000 {
+            if ws.should_write_signal("below_threshold", true, now, CADENCE).is_some() {
+                writes += 1;
+                ws.last_signal_write_ms = Some(now);
+            }
+            now += 250;
+        }
+        assert_eq!(
+            writes, 60,
+            "expected ~one row per 5s over a 300s window, got {}",
+            writes
+        );
+    }
 }

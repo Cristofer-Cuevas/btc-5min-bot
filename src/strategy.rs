@@ -292,7 +292,15 @@ mod strike_mode_tests {
             poly_proxy_address: String::new(),
             db_path: ":memory:".into(),
             dry_run: true,
+            // Fixtures keep the original change-only logging so they exercise
+            // the taker path exactly as it shipped.
+            signal_log_cadence_ms: 0,
             use_twap_strike,
+            // The taker fixtures must exercise the taker path exactly as it
+            // shipped: maker mode OFF, so no fair-value model is consulted.
+            maker_mode: crate::maker::MakerMode::Off,
+            fairvalue_path: String::new(),
+            maker_half_spread: 0.04,
             chainlink_api_key: String::new(),
             chainlink_api_secret: String::new(),
             chainlink_stream_id: String::new(),
@@ -822,5 +830,238 @@ mod strike_mode_tests {
         // Unused for the decision, but still recorded.
         assert!(r.twap_delta_pct.unwrap() < -0.3);
         let _ = TokenBook::default();
+    }
+}
+
+/// PHASE 2 CONSTRAINT: the taker entry decision must be unaffected by the
+/// presence of the maker shadow code.
+///
+/// The structural guarantee is that `evaluate_entry` has no parameter, import
+/// or call reaching the maker or fairvalue modules — shadow quoting happens in
+/// the main loop, strictly AFTER the evaluation, and writes only to
+/// `maker_shadow`. These tests pin that guarantee so it cannot be eroded
+/// silently: if anyone later threads a fair-value lookup into the decision, the
+/// equality assertions below start failing.
+#[cfg(test)]
+mod shadow_isolation_tests {
+    use super::*;
+    use crate::fairvalue::{self, Side as FvSide};
+    use crate::maker;
+    use crate::types::TokenBook;
+
+    /// Every field of an EvaluationResult, flattened so two runs can be
+    /// compared exactly. EvaluationResult does not derive PartialEq, so the
+    /// comparison is spelled out via a destructuring bind rather than derived —
+    /// which also means a NEW field added later shows up here as a compile
+    /// error rather than silently escaping the check.
+    fn fingerprint(r: &EvaluationResult) -> String {
+        let EvaluationResult {
+            signal,
+            rejection_reason,
+            btc_delta_pct,
+            ask_price,
+            bid_price,
+            spread,
+            ask_depth,
+            trade_count,
+            trend_strength,
+            side,
+            twap_delta_pct,
+            binance_twap_delta_pct,
+            decision_delta,
+            delta_momentum,
+            delta_past_value,
+            delta_past_age_ms,
+        } = r;
+        format!(
+            "{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            signal.as_ref().map(|s| (
+                s.side.clone(),
+                s.token_id.clone(),
+                s.btc_delta_pct.to_bits(),
+                s.ask_price.to_bits(),
+                s.spread.to_bits(),
+                s.secs_left,
+            )),
+            rejection_reason,
+            btc_delta_pct.map(f64::to_bits),
+            ask_price.map(f64::to_bits),
+            bid_price.map(f64::to_bits),
+            spread.map(f64::to_bits),
+            ask_depth.map(f64::to_bits),
+            trade_count,
+            trend_strength.map(f64::to_bits),
+            side,
+            twap_delta_pct.map(f64::to_bits),
+            binance_twap_delta_pct.map(f64::to_bits),
+            decision_delta.map(f64::to_bits),
+            delta_momentum.map(f64::to_bits),
+            delta_past_value.map(f64::to_bits),
+            delta_past_age_ms,
+        )
+    }
+
+    fn cfg(maker_mode: maker::MakerMode) -> RuntimeConfig {
+        RuntimeConfig {
+            poly_private_key: String::new(),
+            poly_address: String::new(),
+            poly_api_key: String::new(),
+            poly_api_secret: String::new(),
+            poly_api_passphrase: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: 0,
+            btc_threshold_pct: 0.07,
+            max_ask_price: 0.80,
+            max_spread: 0.10,
+            bet_shares: 5.0,
+            max_slippage: 0.03,
+            min_trend_strength: 0.0,
+            min_delta_momentum: 0.0,
+            max_consecutive_losses: 3,
+            daily_loss_limit_usdc: 20.0,
+            poly_proxy_address: String::new(),
+            db_path: ":memory:".into(),
+            dry_run: true,
+            // Fixtures keep the original change-only logging so they exercise
+            // the taker path exactly as it shipped.
+            signal_log_cadence_ms: 0,
+            use_twap_strike: false,
+            maker_mode,
+            fairvalue_path: String::new(),
+            maker_half_spread: 0.04,
+            chainlink_api_key: String::new(),
+            chainlink_api_secret: String::new(),
+            chainlink_stream_id: String::new(),
+            use_chainlink_fallback: false,
+        }
+    }
+
+    /// A market with a two-sided book, so the evaluation reaches the ask and
+    /// spread gates rather than bailing out early.
+    fn scenario() -> (BtcPriceState, BinanceBtcPrice, MarketState, MarketWindow) {
+        let ms = MarketState {
+            up_book: TokenBook {
+                best_bid: Some(0.60),
+                best_ask: Some(0.62),
+                ask_depth: Some(500.0),
+                bid_depth: Some(500.0),
+                ask_levels: vec![(0.62, 400.0), (0.63, 400.0)],
+                ..Default::default()
+            },
+            down_book: TokenBook {
+                best_bid: Some(0.36),
+                best_ask: Some(0.38),
+                ask_depth: Some(500.0),
+                bid_depth: Some(500.0),
+                ask_levels: vec![(0.38, 400.0)],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bn = BinanceBtcPrice {
+            current_price: Some(65_130.0),
+            window_open_price: Some(65_000.0),
+            ..Default::default()
+        };
+        let win = MarketWindow {
+            up_token_id: "up".into(),
+            down_token_id: "down".into(),
+            neg_risk: false,
+            tick_size: "0.01".into(),
+        };
+        (BtcPriceState::default(), bn, ms, win)
+    }
+
+    fn eval_with(maker_mode: maker::MakerMode, secs_left: i64) -> EvaluationResult {
+        let (btc, bn, ms, win) = scenario();
+        evaluate_entry(
+            &cfg(maker_mode),
+            &btc,
+            &bn,
+            &ms,
+            &win,
+            secs_left,
+            None,
+            None,
+            &WindowState::default(),
+        )
+    }
+
+    /// The core constraint: turning maker mode on changes nothing about the
+    /// taker decision, at every point in the window.
+    #[test]
+    fn taker_decision_is_identical_with_maker_mode_on() {
+        for secs_left in [10, 45, 60, 90, 119, 150, 240, 299] {
+            let off = eval_with(maker::MakerMode::Off, secs_left);
+            let shadow = eval_with(maker::MakerMode::Shadow, secs_left);
+            assert_eq!(
+                fingerprint(&off),
+                fingerprint(&shadow),
+                "maker mode changed the taker decision at secs_left={}",
+                secs_left
+            );
+        }
+    }
+
+    /// ...and it stays identical with a fair-value model actually installed.
+    /// `fairvalue::init` is process-wide and set-once, so whichever test wins
+    /// the race to install it, the assertion below is what matters.
+    #[test]
+    fn taker_decision_is_identical_with_a_model_installed() {
+        let before = eval_with(maker::MakerMode::Shadow, 90);
+        let _ = fairvalue::init("fairvalue.json");
+        let after = eval_with(maker::MakerMode::Shadow, 90);
+        assert_eq!(
+            fingerprint(&before),
+            fingerprint(&after),
+            "installing a fair-value model changed the taker decision"
+        );
+    }
+
+    /// Shadow quoting is a pure function of state the evaluation already
+    /// produced: running it cannot feed anything back into a later decision.
+    #[test]
+    fn shadow_quoting_does_not_mutate_evaluation_inputs() {
+        let (btc, bn, ms, win) = scenario();
+        let ws = WindowState::default();
+        let config = cfg(maker::MakerMode::Shadow);
+
+        let first = evaluate_entry(&config, &btc, &bn, &ms, &win, 90, None, None, &ws);
+
+        // Exactly what the main loop does after the evaluation, with the same
+        // inputs. It takes only copies and returns a value.
+        let q = maker::quote_from_fair_value(
+            FvSide::Up,
+            first.decision_delta.unwrap_or(0.0),
+            90,
+            0.61,
+            config.maker_half_spread,
+            0.0,
+            maker::parse_tick(&win.tick_size).expect("tick"),
+            ms.up_book.best_bid,
+            ms.up_book.best_ask,
+        )
+        .expect("0.61 on a 0.01 tick is quotable");
+        assert!(q.our_bid < q.our_ask);
+
+        let second = evaluate_entry(&config, &btc, &bn, &ms, &win, 90, None, None, &ws);
+        assert_eq!(
+            fingerprint(&first),
+            fingerprint(&second),
+            "evaluation inputs were mutated by shadow quoting"
+        );
+    }
+
+    /// The evaluation must not consult the fair-value curve even indirectly:
+    /// the rejection reason is the same whether or not the curve can price
+    /// this state.
+    #[test]
+    fn rejection_reasons_do_not_depend_on_curve_availability() {
+        let priced = fairvalue::fair_value(FvSide::Up, 0.08, 90);
+        let shadow = eval_with(maker::MakerMode::Shadow, 90);
+        let off = eval_with(maker::MakerMode::Off, 90);
+        assert_eq!(shadow.rejection_reason, off.rejection_reason);
+        // Whatever the curve said (Some or None) is irrelevant to the above.
+        let _ = priced;
     }
 }

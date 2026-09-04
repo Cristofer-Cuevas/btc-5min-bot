@@ -231,6 +231,10 @@ async fn handle_update(
             let n = parts.get(1).and_then(|v| v.parse::<i64>().ok()).unwrap_or(5);
             build_last_trades(db, n).await
         }
+        "/maker" => {
+            let n = parts.get(1).and_then(|v| v.parse::<i64>().ok()).unwrap_or(200);
+            build_maker_report(config, db, n).await
+        }
         "/testorder" => build_testorder(&parts, config, wallet, http_client, sdk_client).await,
         _ => return, // Ignore unknown commands
     };
@@ -337,6 +341,7 @@ fn build_help() -> String {
      /config — current strategy params\n\
      /limits — risk limits (consec losses, daily cap)\n\
      /last [N] — last N trades (default 5)\n\
+     /maker [N] — shadow-quoting adverse selection (default 200 rows)\n\
      \n\
      <b>Parameters</b>\n\
      /set_threshold &lt;pct&gt; — BTC delta threshold (e.g. 0.08)\n\
@@ -541,6 +546,93 @@ async fn build_testorder(
 }
 
 /// Send daily summary at midnight UTC.
+/// PHASE 2 shadow-quoting report. Reads `maker_shadow` only; sends no orders.
+///
+/// The headline number is the bid-fill hit rate. If simulated bid fills land on
+/// the losing side materially more often than fair value implies, we are being
+/// adversely selected and market making does not work at this latency — that is
+/// the Phase 3 gate.
+async fn build_maker_report(config: &SharedConfig, db: &Arc<Database>, n: i64) -> String {
+    let (mode, half_spread, fv_path) = {
+        let cfg = config.read().await;
+        (
+            cfg.maker_mode.as_str(),
+            cfg.maker_half_spread,
+            cfg.fairvalue_path.clone(),
+        )
+    };
+
+    if mode == "off" {
+        return format!(
+            "<b>Maker shadow</b>\n\
+             MAKER_MODE=off — no shadow rows are being written.\n\
+             Set MAKER_MODE=shadow (FAIRVALUE_PATH={}) to start measuring.",
+            fv_path
+        );
+    }
+
+    let s = db.maker_shadow_summary(n);
+    let pending = db.maker_shadow_pending();
+
+    if s.rows == 0 {
+        return format!(
+            "<b>Maker shadow</b> (mode={}, half-spread={:.3})\n\
+             No RESOLVED shadow rows yet. {} row(s) awaiting resolution.\n\
+             Rows are labelled when their window settles (~2-3 min after close).",
+            mode, half_spread, pending
+        );
+    }
+
+    let pct = |num: i64, den: i64| -> String {
+        if den == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.1}%", 100.0 * num as f64 / den as f64)
+        }
+    };
+
+    let span = match (s.first_ts_ms, s.last_ts_ms) {
+        (Some(a), Some(b)) => format!("{:.1}h", (b - a) as f64 / 3_600_000.0),
+        _ => "n/a".into(),
+    };
+
+    let divergence = match s.mean_abs_fv_minus_mid {
+        Some(v) => format!("{:.4}", v),
+        None => "n/a (no two-sided book)".into(),
+    };
+
+    format!(
+        "<b>Maker shadow</b> (mode={}, half-spread={:.3})\n\
+         NO ORDERS SENT — measurement only.\n\n\
+         Resolved rows: {} (span {}), pending {}\n\n\
+         <b>Simulated BID fills</b> (we would have BOUGHT)\n\
+         fills: {} of {} rows ({})\n\
+         on winning side: {} ({})\n\n\
+         <b>Simulated ASK fills</b> (we would have SOLD)\n\
+         fills: {} of {} rows ({})\n\
+         side went on to win: {} ({}) — high is bad, we sold the winner\n\n\
+         <b>Model vs market</b>\n\
+         mean |fair_value - mid|: {}\n\
+         (large and persistent means the model is wrong, not the market)",
+        mode,
+        half_spread,
+        s.rows,
+        span,
+        pending,
+        s.bid_fills,
+        s.rows,
+        pct(s.bid_fills, s.rows),
+        s.bid_fills_on_winner,
+        pct(s.bid_fills_on_winner, s.bid_fills),
+        s.ask_fills,
+        s.rows,
+        pct(s.ask_fills, s.rows),
+        s.ask_fills_on_winner,
+        pct(s.ask_fills_on_winner, s.ask_fills),
+        divergence,
+    )
+}
+
 pub async fn send_daily_summary(config: &SharedConfig, db: &Arc<Database>) {
     let stats = db.get_stats_today();
     let text = format!(
