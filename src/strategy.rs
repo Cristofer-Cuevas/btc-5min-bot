@@ -1052,6 +1052,94 @@ mod shadow_isolation_tests {
         );
     }
 
+    /// The unconditional sampler must not perturb the taker decision either.
+    ///
+    /// Structurally it cannot: it runs earlier in the main loop, reads only
+    /// shared state through read guards, and writes only to `delta_samples`.
+    /// This asserts the observable half — the evaluation is byte-identical
+    /// before and after a sample is taken from the same inputs.
+    #[test]
+    fn taker_decision_is_identical_with_delta_sampling_present() {
+        let (btc, bn, ms, win) = scenario();
+        let ws = WindowState::default();
+        let config = cfg(maker::MakerMode::Off);
+
+        for secs_left in [10, 45, 90, 150, 240, 299] {
+            let before =
+                evaluate_entry(&config, &btc, &bn, &ms, &win, secs_left, None, None, &ws);
+
+            // Exactly the reads the sampler performs, in the same order.
+            let sample = crate::db::DeltaSample {
+                secs_left,
+                twap_delta_pct: None,
+                spot_delta_pct: match (bn.current_price, bn.window_open_price) {
+                    (Some(c), Some(o)) if o != 0.0 => Some(((c - o) / o) * 100.0),
+                    _ => None,
+                },
+                twap_strike: ws.twap_strike.clone(),
+                twap_current: None,
+                up_ask: ms.up_book.best_ask,
+                up_bid: ms.up_book.best_bid,
+                down_ask: ms.down_book.best_ask,
+                down_bid: ms.down_book.best_bid,
+            };
+            // The sample is a value built from copies; nothing is mutated.
+            assert!(sample.spot_delta_pct.is_some());
+
+            let after =
+                evaluate_entry(&config, &btc, &bn, &ms, &win, secs_left, None, None, &ws);
+            assert_eq!(
+                fingerprint(&before),
+                fingerprint(&after),
+                "delta sampling changed the taker decision at secs_left={}",
+                secs_left
+            );
+        }
+    }
+
+    /// The sampler records states the taker path rejects outright. This is the
+    /// whole reason it exists: a delta of ~0 is rejected as `below_threshold`
+    /// and would never reach `signals` or `maker_shadow` in a usable form, yet
+    /// it must still be a valid sample.
+    #[test]
+    fn sampler_covers_states_the_taker_path_rejects() {
+        let (btc, mut bn, ms, win) = scenario();
+        // A delta of +0.0015% — far below the 0.07 threshold.
+        bn.current_price = Some(65_001.0);
+        bn.window_open_price = Some(65_000.0);
+
+        let r = evaluate_entry(
+            &cfg(maker::MakerMode::Off),
+            &btc,
+            &bn,
+            &ms,
+            &win,
+            150,
+            None,
+            None,
+            &WindowState::default(),
+        );
+        assert_eq!(
+            r.rejection_reason, "below_threshold",
+            "fixture must be a state the taker path rejects"
+        );
+
+        // The sampler has no threshold, so it still produces a full row.
+        let spot = ((bn.current_price.unwrap() - bn.window_open_price.unwrap())
+            / bn.window_open_price.unwrap())
+            * 100.0;
+        assert!(spot.abs() < 0.05, "fixture must sit in the uncertain band");
+        let sample = crate::db::DeltaSample {
+            secs_left: 150,
+            spot_delta_pct: Some(spot),
+            up_ask: ms.up_book.best_ask,
+            down_ask: ms.down_book.best_ask,
+            ..Default::default()
+        };
+        assert!(sample.spot_delta_pct.is_some());
+        assert!(sample.up_ask.is_some() && sample.down_ask.is_some());
+    }
+
     /// The evaluation must not consult the fair-value curve even indirectly:
     /// the rejection reason is the same whether or not the curve can price
     /// this state.

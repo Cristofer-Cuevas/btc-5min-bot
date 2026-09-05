@@ -59,3 +59,11 @@ pub const TWAP_STRIKE_LOOKBACK_TOLERANCE_MS: i64 = 30_000;
 
 /// Length of a trading window in seconds.
 pub const WINDOW_SECS: i64 = 300;
+
+/// How often the unconditional delta sampler writes a `delta_samples` row.
+///
+/// The sampler is deliberately NOT gated by threshold, trend, side selection,
+/// pause state or resolution — see the sampler block in main.rs. Every gate the
+/// strategy applies removes exactly the observations a pricing model needs, so
+/// this cadence is the only thing that decides whether a row is written.
+pub const DELTA_SAMPLE_INTERVAL_MS: i64 = 5_000;

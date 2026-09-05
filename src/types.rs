@@ -402,6 +402,14 @@ pub struct WindowState {
     /// trigger in [`WindowState::should_write_signal`]. Cleared on rotation so
     /// every window logs its first qualifying evaluation immediately.
     pub last_signal_write_ms: Option<i64>,
+
+    /// When the last `delta_samples` row was written this window.
+    ///
+    /// This is the ONLY thing that gates the unconditional sampler — no
+    /// threshold, trend, side, pause or resolution check participates. Cleared
+    /// on rotation so every window samples from its first tick, including the
+    /// windows the bot never trades.
+    pub last_delta_sample_ms: Option<i64>,
 }
 
 /// Why a `signals` row is being written. Recorded so the fitted curve can be

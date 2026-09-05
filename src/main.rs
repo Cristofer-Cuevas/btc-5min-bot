@@ -461,6 +461,10 @@ async fn main() {
                 // log its first qualifying evaluation without waiting out the
                 // previous window's interval.
                 ws.last_signal_write_ms = None;
+                // Same for the unconditional sampler: every window starts
+                // recording at its first tick, including windows the bot will
+                // never trade.
+                ws.last_delta_sample_ms = None;
             }
 
             // Reset market state. MarketState is shared across windows and
@@ -635,6 +639,101 @@ async fn main() {
                     .and_then(|(v, _, _)| format_e18(v))
                     .unwrap_or_else(|| "N/A".into()),
             );
+        }
+
+        // ── UNCONDITIONAL DELTA SAMPLING (measurement only) ──
+        //
+        // Placed HERE, before the retry check and before evaluate_entry, and
+        // reading raw shared state rather than `eval_result`, because
+        // `eval_result` is precisely the filtered object this table exists to
+        // escape. Every gate the strategy applies — threshold, trend, momentum,
+        // RTDS agreement, ask price, spread, depth, timing — removes exactly the
+        // observations a pricing model needs. The delta that never clears the
+        // threshold is not noise to a market maker; it is the middle of the
+        // distribution, where all the business is.
+        //
+        // So the ONLY condition below is the cadence. In particular this block
+        // deliberately does NOT check:
+        //   * the delta magnitude or the entry threshold
+        //   * trend strength, choppiness, or momentum
+        //   * whether a side was selected — there is no side here, only the
+        //     signed delta and both books
+        //   * ws.paused, ws.entered, ws.failed_attempts
+        //   * ms.resolved, or whether a market was discovered at all
+        //
+        // Anything unavailable is written as NULL. Nothing is substituted: a
+        // filled-in value would be indistinguishable from a real observation in
+        // the fitted curve, which is the failure mode that produced the
+        // near-certainty-only model in the first place.
+        {
+            let due = {
+                let ws = window_state.read().await;
+                match ws.last_delta_sample_ms {
+                    Some(last) => now_ms.saturating_sub(last) >= DELTA_SAMPLE_INTERVAL_MS,
+                    // First tick of the window: sample immediately.
+                    None => true,
+                }
+            };
+
+            if due {
+                // The TWAP delta, recomputed here from the raw feed rather than
+                // taken from the evaluation, so a window the evaluation bailed
+                // out of still produces a sample. Both sides must be fresh;
+                // fresh_twap_30 returns None on a stale reading, so a silent
+                // feed yields NULL rather than a delta against a stale price.
+                let (twap_delta, twap_strike, twap_current) = {
+                    let ws = window_state.read().await;
+                    let strike = ws.twap_strike.clone();
+                    drop(ws);
+                    let btc = btc_price.read().await;
+                    match btc.fresh_twap_30(now_ms, TWAP_MAX_AGE_MS) {
+                        Some((current, _)) => {
+                            let delta = strike
+                                .as_deref()
+                                .and_then(|st| types::twap_delta_pct(st, &current));
+                            (delta, strike, Some(current))
+                        }
+                        None => (None, strike, None),
+                    }
+                };
+
+                // Binance spot delta, for cross-reference against the TWAP
+                // delta that actually settles the market.
+                let spot_delta = {
+                    let bn = binance_price.read().await;
+                    match (bn.current_price, bn.window_open_price) {
+                        (Some(c), Some(o)) if o != 0.0 => Some(((c - o) / o) * 100.0),
+                        _ => None,
+                    }
+                };
+
+                // Both books, unconditionally. An empty side is NULL.
+                let (up_bid, up_ask, down_bid, down_ask) = {
+                    let ms = market_state.read().await;
+                    (
+                        ms.up_book.best_bid,
+                        ms.up_book.best_ask,
+                        ms.down_book.best_bid,
+                        ms.down_book.best_ask,
+                    )
+                };
+
+                let sample = db::DeltaSample {
+                    secs_left,
+                    twap_delta_pct: twap_delta,
+                    spot_delta_pct: spot_delta,
+                    twap_strike,
+                    twap_current,
+                    up_ask,
+                    up_bid,
+                    down_ask,
+                    down_bid,
+                };
+                db.insert_delta_sample(current_ts as i64, now_ms, &sample);
+
+                let mut ws = window_state.write().await;
+                ws.last_delta_sample_ms = Some(now_ms);
+            }
         }
 
         // ── Pre-fetch next window (once, 10-15s before end) ──
@@ -1316,6 +1415,20 @@ async fn main() {
                     continue;
                 }
             };
+
+            // Backfill the settled outcome onto this window's unconditional
+            // samples. Deliberately OUTSIDE the `already_resolved` guard below
+            // and before the trade lookup: most resolutions belong to windows
+            // the bot never traded, and those are the ones carrying the
+            // observations the pricing model is missing. The UPDATE's own
+            // `actual_resolution IS NULL` clause makes it idempotent.
+            let labelled = db.resolve_delta_samples(window_ts, &event.winning_outcome);
+            if labelled > 0 {
+                info!(
+                    "delta_samples: labelled {} sample(s) for window {} as {}",
+                    labelled, window_ts, event.winning_outcome
+                );
+            }
 
             // Find the trade for this specific window
             let trade = db.get_trade_by_window_ts(window_ts);

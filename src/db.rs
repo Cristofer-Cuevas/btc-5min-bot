@@ -262,6 +262,42 @@ impl Database {
                 PRIMARY KEY (window_ts, timestamp_ms, side)
             );
 
+            -- UNCONDITIONAL DELTA SAMPLING. The pricing dataset.
+            --
+            -- One row every DELTA_SAMPLE_INTERVAL_MS for EVERY window, with no
+            -- filtering of any kind: no threshold, no trend gate, no side
+            -- selection, no pause or resolution check. Written for windows the
+            -- bot never trades, which is most of them.
+            --
+            -- This exists because every other table is conditioned on the
+            -- strategy's own gates, and those gates admit only the obvious
+            -- moves. A curve fitted on them knows how to price near-certainties
+            -- and nothing else -- exactly the wrong half of the distribution
+            -- for a market maker, whose business is the uncertain middle.
+            --
+            -- `maker_shadow` is worse than merely filtered: it is only written
+            -- when fair_value() already returns Some, so it can never contain a
+            -- cell the current curve cannot price. Refitting from it reproduces
+            -- the existing coverage hole exactly. This table breaks that loop.
+            --
+            -- NULL means genuinely unavailable (stale TWAP, empty book side).
+            -- No field is ever substituted or interpolated.
+            CREATE TABLE IF NOT EXISTS delta_samples (
+                window_ts           INTEGER NOT NULL,
+                timestamp_ms        INTEGER NOT NULL,
+                secs_left           INTEGER NOT NULL,
+                twap_delta_pct      REAL,
+                spot_delta_pct      REAL,
+                twap_strike         TEXT,
+                twap_current        TEXT,
+                up_ask              REAL,
+                up_bid              REAL,
+                down_ask            REAL,
+                down_bid            REAL,
+                actual_resolution   TEXT,
+                PRIMARY KEY (window_ts, timestamp_ms)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_maker_shadow_window
                 ON maker_shadow(window_ts);
             CREATE INDEX IF NOT EXISTS idx_maker_shadow_ts
@@ -449,6 +485,29 @@ impl Database {
                 let sql = format!("ALTER TABLE maker_shadow ADD COLUMN {} {}", name, ty);
                 if let Err(e) = conn.execute(&sql, []) {
                     error!("Failed to add maker_shadow column {}: {}", name, e);
+                }
+            }
+        }
+
+        // delta_samples columns, pragma-guarded like every other migration.
+        // The PRIMARY KEY columns are created with the table and never altered.
+        let delta_sample_cols: [(&str, &str); 10] = [
+            ("twap_delta_pct", "REAL"),
+            ("spot_delta_pct", "REAL"),
+            ("twap_strike", "TEXT"),
+            ("twap_current", "TEXT"),
+            ("up_ask", "REAL"),
+            ("up_bid", "REAL"),
+            ("down_ask", "REAL"),
+            ("down_bid", "REAL"),
+            ("actual_resolution", "TEXT"),
+            ("secs_left", "INTEGER"),
+        ];
+        for (name, ty) in &delta_sample_cols {
+            if !column_exists(&conn, "delta_samples", name) {
+                let sql = format!("ALTER TABLE delta_samples ADD COLUMN {} {}", name, ty);
+                if let Err(e) = conn.execute(&sql, []) {
+                    error!("Failed to add delta_samples column {}: {}", name, e);
                 }
             }
         }
@@ -1164,6 +1223,131 @@ pub struct MakerShadowSummary {
     pub last_ts_ms: Option<i64>,
 }
 
+
+/// One unconditional observation of market state. Every field is Option
+/// because every field can be genuinely unavailable, and a substituted value
+/// would be indistinguishable from a real one in the fitted curve.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeltaSample {
+    pub secs_left: i64,
+    pub twap_delta_pct: Option<f64>,
+    pub spot_delta_pct: Option<f64>,
+    pub twap_strike: Option<String>,
+    pub twap_current: Option<String>,
+    pub up_ask: Option<f64>,
+    pub up_bid: Option<f64>,
+    pub down_ask: Option<f64>,
+    pub down_bid: Option<f64>,
+}
+
+/// Coverage of the fitted grid, for the `/maker` report and the coverage check.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaSampleCoverage {
+    pub rows: i64,
+    pub resolved_rows: i64,
+    pub windows: i64,
+    pub resolved_windows: i64,
+    /// Rows in the uncertain middle band, |twap_delta| < 0.05 — the region the
+    /// signals-based fit had no observations of.
+    pub mid_band_rows: i64,
+    pub mid_band_resolved: i64,
+}
+
+impl Database {
+    // ── UNCONDITIONAL DELTA SAMPLING ──
+
+    /// Record one unconditional market-state sample.
+    ///
+    /// `INSERT OR IGNORE`: the primary key is (window_ts, timestamp_ms), and a
+    /// duplicate is a harmless double-fire, not an error worth logging.
+    ///
+    /// Failures are logged and swallowed. This is a measurement side-channel
+    /// and must never be able to disturb the trading loop.
+    pub fn insert_delta_sample(&self, window_ts: i64, timestamp_ms: i64, s: &DeltaSample) {
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = conn.execute(
+            "INSERT OR IGNORE INTO delta_samples (
+                window_ts, timestamp_ms, secs_left,
+                twap_delta_pct, spot_delta_pct, twap_strike, twap_current,
+                up_ask, up_bid, down_ask, down_bid
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                window_ts,
+                timestamp_ms,
+                s.secs_left,
+                s.twap_delta_pct,
+                s.spot_delta_pct,
+                s.twap_strike,
+                s.twap_current,
+                s.up_ask,
+                s.up_bid,
+                s.down_ask,
+                s.down_bid,
+            ],
+        ) {
+            error!("Failed to insert delta_sample: {}", e);
+        }
+    }
+
+    /// Backfill the settled outcome onto every sample of a window.
+    ///
+    /// Called for EVERY resolution, including windows the bot never traded --
+    /// those are the majority and they carry most of the information, because
+    /// they are the ones where no signal ever qualified.
+    ///
+    /// Idempotent: the `actual_resolution IS NULL` clause means a repeated or
+    /// contradictory later resolution cannot relabel settled rows.
+    pub fn resolve_delta_samples(&self, window_ts: i64, resolution: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        match conn.execute(
+            "UPDATE delta_samples SET actual_resolution = ?1
+              WHERE window_ts = ?2 AND actual_resolution IS NULL",
+            params![resolution, window_ts],
+        ) {
+            Ok(n) => n as i64,
+            Err(e) => {
+                error!("Failed to backfill delta_samples resolution: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Sampling coverage, with the uncertain middle band called out separately.
+    ///
+    /// The mid-band counts are the whole point: if they stay at zero, something
+    /// is still filtering the sampler and the refit will reproduce the same
+    /// hole rather than close it.
+    pub fn delta_sample_coverage(&self) -> DeltaSampleCoverage {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT
+                COUNT(*),
+                SUM(CASE WHEN actual_resolution IS NOT NULL THEN 1 ELSE 0 END),
+                COUNT(DISTINCT window_ts),
+                COUNT(DISTINCT CASE WHEN actual_resolution IS NOT NULL
+                                    THEN window_ts END),
+                SUM(CASE WHEN twap_delta_pct IS NOT NULL
+                          AND ABS(twap_delta_pct) < 0.05 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN twap_delta_pct IS NOT NULL
+                          AND ABS(twap_delta_pct) < 0.05
+                          AND actual_resolution IS NOT NULL THEN 1 ELSE 0 END)
+             FROM delta_samples",
+            [],
+            |row| {
+                Ok(DeltaSampleCoverage {
+                    rows: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    resolved_rows: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    windows: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    resolved_windows: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    mid_band_rows: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    mid_band_resolved: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                })
+            },
+        )
+        .unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod migration_tests {
     use super::*;
@@ -1436,21 +1620,41 @@ mod migration_tests {
         // Counts BEFORE the migration runs.
         let before: Vec<(String, i64)> = {
             let conn = Connection::open(&path).expect("open copy");
-            ["trades", "signals", "twap_observations", "daily_stats"]
-                .iter()
-                .map(|t| {
-                    let n: i64 = conn
-                        .query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0))
-                        .unwrap_or(-1);
-                    ((*t).to_string(), n)
-                })
-                .collect()
+            // -1 means the table does not exist yet on this copy, which is a
+            // legitimate pre-migration state and is asserted against below.
+            [
+                "trades",
+                "signals",
+                "twap_observations",
+                "daily_stats",
+                "maker_shadow",
+                "delta_samples",
+            ]
+            .iter()
+            .map(|t| {
+                let n: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {}", t), [], |r| r.get(0))
+                    .unwrap_or(-1);
+                ((*t).to_string(), n)
+            })
+            .collect()
         };
 
         let db = Database::new(&path).expect("migrate live copy");
 
         for (table, n_before) in &before {
             let n_after = count(&db, table);
+            if *n_before < 0 {
+                // Table created by this migration: it must now exist and be
+                // empty, never populated with invented rows.
+                println!("{:<20} before=(absent) after={}", table, n_after);
+                assert_eq!(
+                    n_after, 0,
+                    "{} was created by the migration but is not empty",
+                    table
+                );
+                continue;
+            }
             println!("{:<20} before={} after={}", table, n_before, n_after);
             assert_eq!(
                 *n_before, n_after,
@@ -1458,10 +1662,233 @@ mod migration_tests {
                 table
             );
         }
-        println!("{:<20} after={}", "maker_shadow", count(&db, "maker_shadow"));
 
         let conn = db.conn.lock().unwrap();
         assert!(column_exists(&conn, "maker_shadow", "fill_was_correct"));
         assert!(column_exists(&conn, "signals", "decision_delta"));
+        assert!(column_exists(&conn, "delta_samples", "twap_delta_pct"));
+        assert!(column_exists(&conn, "delta_samples", "actual_resolution"));
+    }
+}
+
+#[cfg(test)]
+mod delta_sample_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("btc5min-ds-{}-{}.db", name, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn sample(delta: Option<f64>, secs_left: i64) -> DeltaSample {
+        DeltaSample {
+            secs_left,
+            twap_delta_pct: delta,
+            spot_delta_pct: delta,
+            twap_strike: Some("65000000000000000000000".into()),
+            twap_current: Some("65010000000000000000000".into()),
+            up_ask: Some(0.52),
+            up_bid: Some(0.50),
+            down_ask: Some(0.50),
+            down_bid: Some(0.48),
+        }
+    }
+
+    /// THE POINT OF THE TABLE: a delta of ~0, which no strategy gate would ever
+    /// let through, is stored and retrievable. This is the band the
+    /// signals-based and maker_shadow-based fits had no observations of.
+    #[test]
+    fn near_zero_deltas_are_recorded() {
+        let path = tmp("midband");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        for (i, d) in [0.0, 0.001, -0.004, 0.012, -0.031, 0.049].iter().enumerate() {
+            db.insert_delta_sample(300, 1_000 + i as i64, &sample(Some(*d), 200));
+        }
+
+        let cov = db.delta_sample_coverage();
+        assert_eq!(cov.rows, 6);
+        assert_eq!(
+            cov.mid_band_rows, 6,
+            "every one of these is inside |delta| < 0.05 and must be counted"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A window the bot never traded still gets its samples labelled. Those
+    /// windows are the majority and carry the observations the model lacks.
+    #[test]
+    fn untraded_windows_are_backfilled_at_resolution() {
+        let path = tmp("untraded");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        // No trade is ever inserted for window 300.
+        db.insert_delta_sample(300, 1_000, &sample(Some(0.01), 250));
+        db.insert_delta_sample(300, 6_000, &sample(Some(0.02), 245));
+
+        let labelled = db.resolve_delta_samples(300, "Up");
+        assert_eq!(labelled, 2, "untraded window was not backfilled");
+        assert!(db.get_trade_by_window_ts(300).is_none(), "fixture sanity");
+
+        let cov = db.delta_sample_coverage();
+        assert_eq!(cov.resolved_rows, 2);
+        assert_eq!(cov.resolved_windows, 1);
+        assert_eq!(cov.mid_band_resolved, 2);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Backfill is idempotent and never relabels a settled sample.
+    #[test]
+    fn backfill_does_not_relabel() {
+        let path = tmp("relabel");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        db.insert_delta_sample(300, 1_000, &sample(Some(0.01), 250));
+        assert_eq!(db.resolve_delta_samples(300, "Up"), 1);
+        assert_eq!(db.resolve_delta_samples(300, "Down"), 0);
+
+        let conn_res: String = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT actual_resolution FROM delta_samples WHERE window_ts = 300",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(conn_res, "Up");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Unavailable inputs are stored as NULL, never substituted. A filled-in
+    /// value would be indistinguishable from a real observation in the fit.
+    #[test]
+    fn unavailable_fields_are_null_not_substituted() {
+        let path = tmp("nulls");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        // Stale TWAP and an entirely empty book.
+        db.insert_delta_sample(
+            300,
+            1_000,
+            &DeltaSample {
+                secs_left: 120,
+                ..Default::default()
+            },
+        );
+
+        let conn = db.conn.lock().unwrap();
+        let (twap, spot, up_ask, strike): (
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT twap_delta_pct, spot_delta_pct, up_ask, twap_strike
+                   FROM delta_samples WHERE window_ts = 300",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(twap, None);
+        assert_eq!(spot, None);
+        assert_eq!(up_ask, None);
+        assert_eq!(strike, None);
+        drop(conn);
+
+        // A NULL delta is not counted as being in the mid band.
+        assert_eq!(db.delta_sample_coverage().mid_band_rows, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A duplicate (window_ts, timestamp_ms) is ignored rather than erroring,
+    /// and does not double-count.
+    #[test]
+    fn duplicate_samples_are_ignored() {
+        let path = tmp("dupe");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+        db.insert_delta_sample(300, 1_000, &sample(Some(0.01), 250));
+        db.insert_delta_sample(300, 1_000, &sample(Some(0.99), 250));
+        assert_eq!(db.delta_sample_coverage().rows, 1);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Samples span the whole window, including the stretch before any signal
+    /// could qualify and after a window would have resolved.
+    #[test]
+    fn samples_span_the_entire_window() {
+        let path = tmp("span");
+        let db = Database::new(path.to_str().unwrap()).expect("open");
+
+        // 60 samples at 5s over a 300s window, delta drifting through zero.
+        for i in 0..60i64 {
+            let secs_left = 300 - i * 5;
+            let delta = (i as f64 - 30.0) * 0.004; // -0.12 .. +0.116
+            db.insert_delta_sample(300, i * 5_000, &sample(Some(delta), secs_left));
+        }
+        db.resolve_delta_samples(300, "Up");
+
+        let cov = db.delta_sample_coverage();
+        assert_eq!(cov.rows, 60);
+        assert_eq!(cov.resolved_rows, 60);
+        // Roughly a quarter of that sweep lies inside |delta| < 0.05.
+        assert!(
+            cov.mid_band_rows >= 20,
+            "expected substantial mid-band coverage, got {}",
+            cov.mid_band_rows
+        );
+
+        let conn = db.conn.lock().unwrap();
+        let (lo, hi): (i64, i64) = conn
+            .query_row(
+                "SELECT MIN(secs_left), MAX(secs_left) FROM delta_samples",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((lo, hi), (5, 300), "samples must span the full window");
+
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The sampler's cadence is the ONLY gate. This mirrors the main-loop
+    /// condition exactly: nothing about threshold, trend, side, pause or
+    /// resolution participates, so a state that every strategy gate rejects
+    /// still produces a sample on schedule.
+    #[test]
+    fn cadence_is_the_only_gate() {
+        let mut last: Option<i64> = None;
+        let mut written = 0;
+        let mut now = 0i64;
+        while now < 300_000 {
+            let due = match last {
+                Some(l) => now.saturating_sub(l) >= crate::constants::DELTA_SAMPLE_INTERVAL_MS,
+                None => true,
+            };
+            if due {
+                written += 1;
+                last = Some(now);
+            }
+            now += 250;
+        }
+        assert_eq!(
+            written, 60,
+            "expected 60 samples per 300s window at a 5s cadence, got {}",
+            written
+        );
     }
 }

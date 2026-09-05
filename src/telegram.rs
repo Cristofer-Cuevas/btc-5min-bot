@@ -574,12 +574,33 @@ async fn build_maker_report(config: &SharedConfig, db: &Arc<Database>, n: i64) -
     let s = db.maker_shadow_summary(n);
     let pending = db.maker_shadow_pending();
 
+    // Sampling coverage. Reported before the fill stats because it decides
+    // whether they mean anything: maker_shadow is only written where the
+    // CURRENT curve already prices, so it can never reveal a coverage hole.
+    // delta_samples is unfiltered, and its mid-band count is the number that
+    // says whether the next refit can close one.
+    let cov = db.delta_sample_coverage();
+    let mid_pct = if cov.rows > 0 {
+        format!("{:.1}%", 100.0 * cov.mid_band_rows as f64 / cov.rows as f64)
+    } else {
+        "n/a".into()
+    };
+    let sampling = format!(
+        "<b>Unconditional samples</b>\n\
+         rows: {} ({} labelled) over {} windows ({} settled)\n\
+         uncertain band |Δ|&lt;0.05: {} rows ({}), {} labelled\n\
+         (that band is what the signals-based fit had none of)",
+        cov.rows, cov.resolved_rows, cov.windows, cov.resolved_windows,
+        cov.mid_band_rows, mid_pct, cov.mid_band_resolved,
+    );
+
     if s.rows == 0 {
         return format!(
             "<b>Maker shadow</b> (mode={}, half-spread={:.3})\n\
              No RESOLVED shadow rows yet. {} row(s) awaiting resolution.\n\
-             Rows are labelled when their window settles (~2-3 min after close).",
-            mode, half_spread, pending
+             Rows are labelled when their window settles (~2-3 min after close).\n\n\
+             {}",
+            mode, half_spread, pending, sampling
         );
     }
 
@@ -613,7 +634,8 @@ async fn build_maker_report(config: &SharedConfig, db: &Arc<Database>, n: i64) -
          side went on to win: {} ({}) — high is bad, we sold the winner\n\n\
          <b>Model vs market</b>\n\
          mean |fair_value - mid|: {}\n\
-         (large and persistent means the model is wrong, not the market)",
+         (large and persistent means the model is wrong, not the market)\n\n\
+         {}",
         mode,
         half_spread,
         s.rows,
@@ -630,6 +652,7 @@ async fn build_maker_report(config: &SharedConfig, db: &Arc<Database>, n: i64) -
         s.ask_fills_on_winner,
         pct(s.ask_fills_on_winner, s.ask_fills),
         divergence,
+        sampling,
     )
 }
 

@@ -61,7 +61,8 @@ METHOD
 
 Usage:
     python tools/build_fairvalue.py [--db trades.db] [--out fairvalue.json]
-                                    [--min-n 20] [--since YYYY-MM-DD] [--report]
+                                    [--min-n 20] [--since YYYY-MM-DD]
+                                    [--source signals|delta_samples] [--report]
 """
 
 from __future__ import annotations
@@ -88,7 +89,11 @@ SECS_EDGES = [0, 30, 60, 90, 120, 180, 240, 301]
 MIN_N = 20
 REFERENCE_SIDE = "Up"
 
-QUERY = """
+# The ORIGINAL source. Conditioned on the strategy's own gates: a row exists
+# only where evaluate_entry got far enough to set a side and a decision delta,
+# and (before SIGNAL_LOG_CADENCE_MS) only at moments the rejection reason
+# changed. Fits from this see near-certainties and little else.
+SIGNALS_QUERY = """
 SELECT s.window_ts,
        s.decision_delta,
        s.secs_left,
@@ -100,6 +105,28 @@ WHERE s.side IS NOT NULL
   AND s.decision_delta IS NOT NULL
   AND s.timestamp_ms >= ?
 """
+
+# The UNCONDITIONAL source. One row every DELTA_SAMPLE_INTERVAL_MS for every
+# window, with no threshold, trend, side, pause or resolution filtering, and
+# actual_resolution backfilled for every settled window including the ones the
+# bot never traded. This is the source a pricing curve should be fitted on.
+#
+# No join is needed: the sampler backfills the outcome onto the row itself.
+DELTA_SAMPLES_QUERY = """
+SELECT window_ts,
+       twap_delta_pct,
+       secs_left,
+       actual_resolution
+FROM delta_samples
+WHERE actual_resolution IS NOT NULL
+  AND twap_delta_pct IS NOT NULL
+  AND timestamp_ms >= ?
+"""
+
+SOURCES = {
+    "signals": SIGNALS_QUERY,
+    "delta_samples": DELTA_SAMPLES_QUERY,
+}
 
 
 def parse_since(value):
@@ -170,12 +197,24 @@ def pava(values: list, weights: list) -> list:
     return out
 
 
-def build(db_path: str, min_n: int, since_ms: int = 0) -> dict:
+def build(db_path: str, min_n: int, since_ms: int = 0,
+          source: str = "signals") -> dict:
+    query = SOURCES[source]
     conn = sqlite3.connect("file:{}?mode=ro".format(db_path), uri=True)
     try:
-        rows = conn.execute(QUERY, (since_ms,)).fetchall()
-    finally:
+        rows = conn.execute(query, (since_ms,)).fetchall()
+    except sqlite3.OperationalError as exc:
         conn.close()
+        raise SystemExit(
+            "cannot read '{}' from {}: {}\n"
+            "If the table does not exist yet, the bot has not run with this "
+            "build long enough to create it.".format(source, db_path, exc)
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     n_secs = len(SECS_EDGES) - 1
     n_delta = len(DELTA_EDGES) + 1
@@ -225,6 +264,7 @@ def build(db_path: str, min_n: int, since_ms: int = 0) -> dict:
         "version": 1,
         "generated_at_ms": int(time.time() * 1000),
         "source_db": db_path,
+        "source_table": source,
         "since_ms": since_ms,
         "reference_side": REFERENCE_SIDE,
         "delta_edges": DELTA_EDGES,
@@ -262,6 +302,7 @@ def report(model: dict) -> None:
             ).strftime("%Y-%m-%d %H:%M UTC"),
             model["since_ms"],
         ))
+    print("source table      : {}".format(model.get("source_table", "signals")))
     print("rows joined       : {}".format(model["rows_total"]))
     print("rows used         : {}".format(model["rows_used"]))
     print("skipped (secs oob): {}".format(
@@ -301,6 +342,57 @@ def report(model: dict) -> None:
         print("  none")
     print()
 
+    # ---- COVERAGE: the deliverable ----
+    #
+    # A curve that can only price near-certainties is useless for making a
+    # market. These two numbers say whether this fit can do better than that.
+    min_n = model["min_n"]
+    populated = 0
+    total = 0
+    for row in grid:
+        for c in row:
+            total += 1
+            if c["n"] >= min_n:
+                populated += 1
+
+    # The uncertain middle band: delta buckets whose whole range lies inside
+    # (-0.05, +0.05). Those are the ones the signals-based fit had none of.
+    mid_idx = [
+        di for di in range(len(model["delta_centers"]))
+        if abs(model["delta_centers"][di]) < 0.05
+    ]
+
+    print("=== COVERAGE ===")
+    print("cells with n >= {}: {} of {}".format(min_n, populated, total))
+    print()
+    print("uncertain band (delta buckets inside +/-0.05):")
+    print("{:>10} {:>20} {:>7} {:>7} {:>9}  flag".format(
+        "secs", "delta bucket", "n", "windows", "p_fit"))
+    mid_populated = 0
+    mid_total = 0
+    for si, row in enumerate(grid):
+        for di in mid_idx:
+            c = row[di]
+            mid_total += 1
+            if c["n"] >= min_n:
+                mid_populated += 1
+            flag = "LOW" if c["low_conf"] else ""
+            print("{:>10} {:>20} {:>7} {:>7} {:>9.4f}  {}".format(
+                secs_label(si), delta_label(di), c["n"], c["w"], c["p"], flag))
+    print()
+    print("uncertain-band cells with n >= {}: {} of {}".format(
+        min_n, mid_populated, mid_total))
+    if mid_populated == 0:
+        print()
+        print("*** THE UNCERTAIN BAND IS STILL EMPTY. ***")
+        print("Something is still filtering the samples. Do NOT deploy this")
+        print("curve: it can only price near-certainties, which is the wrong")
+        print("half of the distribution for making a market. Check that the")
+        print("bot is running the unconditional sampler and that")
+        print("delta_samples has rows with |twap_delta_pct| < 0.05 and a")
+        print("non-NULL actual_resolution.")
+    print()
+
     # Monotonicity assertion -- the fit is worthless if this fails.
     for si, row in enumerate(grid):
         ps = [c["p"] for c in row]
@@ -318,6 +410,15 @@ def main() -> int:
     ap.add_argument("--out", default="fairvalue.json")
     ap.add_argument("--min-n", type=int, default=MIN_N)
     ap.add_argument(
+        "--source",
+        choices=sorted(SOURCES),
+        default="signals",
+        help="which table to fit from. 'signals' (default) preserves the "
+             "original behaviour but is filtered by the strategy's own gates. "
+             "'delta_samples' is the unconditional sampler and is the correct "
+             "source for a market-making curve.",
+    )
+    ap.add_argument(
         "--since",
         default=None,
         help="only use signals at or after this time (YYYY-MM-DD or epoch ms). "
@@ -329,7 +430,7 @@ def main() -> int:
                     help="print the full grid to stdout")
     args = ap.parse_args()
 
-    model = build(args.db, args.min_n, parse_since(args.since))
+    model = build(args.db, args.min_n, parse_since(args.since), args.source)
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(model, fh, indent=1)
     print("wrote {} ({} rows over {}x{} cells)".format(
