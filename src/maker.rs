@@ -1,14 +1,12 @@
 //! PHASE 2 — SHADOW QUOTING. MEASUREMENT ONLY.
 //!
 //! Nothing in this module places, signs, cancels or otherwise touches an order.
-//! It computes the quotes the bot WOULD have posted and records, against the
-//! book at that instant, whether they would have been hit. At resolution the
-//! rows are labelled with the settled outcome.
-//!
-//! The number this exists to produce is ADVERSE SELECTION: of the simulated
-//! bid fills, what fraction landed on the side that actually won. A maker who
-//! is systematically filled on losers cannot make money at any spread, and no
-//! amount of tuning fixes it — that is the gate Phase 3 has to clear.
+//! It computes candidate resting quotes. A single contemporaneous book cannot
+//! establish a passive fill: crossing that book is a taker order (or a rejected
+//! post-only order). Historical `would_*_fill` rows used that invalid rule and
+//! must not be used to infer maker profitability. New rows never claim fills.
+//! A fill study needs order arrival/cancel latency, queue/depth, subsequent
+//! aggressor trades, quantities and inventory, none of which this API receives.
 //!
 //! The taker path does not read anything here. `evaluate_entry` never sees
 //! this module, and `strategy::shadow_isolation_tests` pins that.
@@ -75,24 +73,27 @@ pub struct ShadowQuote {
     pub our_ask: f64,
     pub market_bid: Option<f64>,
     pub market_ask: Option<f64>,
-    /// Someone would have crossed into our bid: the best offer is at or below
-    /// where we were buying.
+    /// Legacy schema field. Always false: same-tick books cannot prove fills.
     pub would_bid_fill: bool,
-    /// Someone would have lifted our ask.
+    /// Legacy schema field. Always false: same-tick books cannot prove fills.
     pub would_ask_fill: bool,
 }
 
 /// Parse a tick size string such as "0.01" from the market metadata. Returns
-/// None for anything non-positive or unparseable — the caller must then skip
+/// None for anything unsupported or unparseable — the caller must then skip
 /// the tick rather than assume a default, since a wrong tick silently shifts
 /// every quote.
 pub fn parse_tick(tick_size: &str) -> Option<f64> {
     let t: f64 = tick_size.trim().parse().ok()?;
-    if t.is_finite() && t > 0.0 {
+    if valid_tick(t) {
         Some(t)
     } else {
         None
     }
+}
+
+fn valid_tick(tick: f64) -> bool {
+    [0.1, 0.01, 0.001, 0.0001].contains(&tick)
 }
 
 /// Round `price` DOWN to a multiple of `tick`.
@@ -182,6 +183,22 @@ pub fn quote_from_fair_value(
     market_bid: Option<f64>,
     market_ask: Option<f64>,
 ) -> Option<ShadowQuote> {
+    if !valid_tick(tick)
+        || !decision_delta.is_finite()
+        || !(0..=300).contains(&secs_left)
+        || !fair_value.is_finite()
+        || !(0.0..=1.0).contains(&fair_value)
+        || !half_spread.is_finite()
+        || half_spread < 0.0
+        || !inventory_skew.is_finite()
+        || market_bid
+            .into_iter()
+            .chain(market_ask)
+            .any(|p| !p.is_finite() || !(0.0..=1.0).contains(&p))
+        || matches!((market_bid, market_ask), (Some(b), Some(a)) if b >= a)
+    {
+        return None;
+    }
     // The tradeable band, expressed ON THE TICK GRID. Clamping to the raw
     // 0.01/0.99 bounds would emit prices off the grid on a coarse tick (a 0.01
     // bid in a 0.1-tick market), which the exchange rejects — so the bounds are
@@ -197,7 +214,8 @@ pub fn quote_from_fair_value(
     // Phase 3 will place real orders this way, and measuring quotes we would
     // not actually post would be measuring the wrong strategy.
     let raw_bid = fair_value - half_spread - inventory_skew;
-    let raw_ask = fair_value + half_spread + inventory_skew;
+    // Positive inventory shifts BOTH prices down: buy less, sell more.
+    let raw_ask = fair_value + half_spread - inventory_skew;
 
     let our_bid = snap(floor_to_tick(raw_bid, tick), tick).clamp(band_lo, band_hi);
     let our_ask = snap(ceil_to_tick(raw_ask, tick), tick).clamp(band_lo, band_hi);
@@ -210,11 +228,13 @@ pub fn quote_from_fair_value(
         return None;
     }
 
-    // Fill simulation. A resting bid is hit when someone's offer comes to it
-    // or below; a resting ask is lifted when a bid reaches it. An absent side
-    // of the book is not a fill — fail closed rather than counting a phantom.
-    let would_bid_fill = market_ask.is_some_and(|a| a <= our_bid + 1e-9);
-    let would_ask_fill = market_bid.is_some_and(|b| b >= our_ask - 1e-9);
+    // Polymarket rejects post-only orders which would match immediately.
+    // https://docs.polymarket.com/concepts/order-lifecycle
+    if market_ask.is_some_and(|a| a <= our_bid + 1e-9)
+        || market_bid.is_some_and(|b| b >= our_ask - 1e-9)
+    {
+        return None;
+    }
 
     Some(ShadowQuote {
         side,
@@ -225,8 +245,8 @@ pub fn quote_from_fair_value(
         our_ask,
         market_bid,
         market_ask,
-        would_bid_fill,
-        would_ask_fill,
+        would_bid_fill: false,
+        would_ask_fill: false,
     })
 }
 
@@ -277,19 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn bid_fills_only_when_the_offer_comes_to_us() {
-        // our_bid = 0.56
-        assert!(q(0.60, 0.04, None, Some(0.56)).would_bid_fill);
-        assert!(q(0.60, 0.04, None, Some(0.50)).would_bid_fill);
-        assert!(!q(0.60, 0.04, None, Some(0.57)).would_bid_fill);
-    }
-
-    #[test]
-    fn ask_fills_only_when_a_bid_reaches_us() {
-        // our_ask = 0.64
-        assert!(q(0.60, 0.04, Some(0.64), None).would_ask_fill);
-        assert!(q(0.60, 0.04, Some(0.70), None).would_ask_fill);
-        assert!(!q(0.60, 0.04, Some(0.63), None).would_ask_fill);
+    fn marketable_candidates_are_post_only_rejections_not_maker_fills() {
+        for (bid, ask) in [
+            (None, Some(0.56)),
+            (None, Some(0.50)),
+            (Some(0.64), None),
+            (Some(0.70), None),
+        ] {
+            assert!(
+                quote_from_fair_value(Side::Up, 0.08, 90, 0.60, 0.04, 0.0, TICK, bid, ask,)
+                    .is_none()
+            );
+        }
+        let s = q(0.60, 0.04, Some(0.57), Some(0.63));
+        assert!(!s.would_bid_fill && !s.would_ask_fill);
     }
 
     #[test]
@@ -300,13 +321,39 @@ mod tests {
     }
 
     #[test]
-    fn wider_half_spread_cannot_increase_fills() {
-        for (bid, ask) in [(Some(0.60), Some(0.62)), (Some(0.50), Some(0.51))] {
-            let tight = q(0.60, 0.01, bid, ask);
-            let wide = q(0.60, 0.10, bid, ask);
-            assert!(!(wide.would_bid_fill && !tight.would_bid_fill));
-            assert!(!(wide.would_ask_fill && !tight.would_ask_fill));
+    fn inventory_skew_moves_both_quotes_down() {
+        let s =
+            quote_from_fair_value(Side::Up, 0.08, 90, 0.60, 0.04, 0.02, TICK, None, None).unwrap();
+        assert!((s.our_bid - 0.54).abs() < 1e-9);
+        assert!((s.our_ask - 0.62).abs() < 1e-9);
+    }
+
+    #[test]
+    fn malformed_inputs_never_produce_quotes_or_panic() {
+        for tick in [0.0, -0.01, 0.03, 0.00001, f64::NAN, f64::INFINITY] {
+            assert!(
+                quote_from_fair_value(Side::Up, 0.08, 90, 0.60, 0.04, 0.0, tick, None, None,)
+                    .is_none()
+            );
         }
+        for fv in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(
+                quote_from_fair_value(Side::Up, 0.08, 90, fv, 0.04, 0.0, TICK, None, None,)
+                    .is_none()
+            );
+        }
+        assert!(quote_from_fair_value(
+            Side::Up,
+            0.08,
+            90,
+            0.6,
+            0.04,
+            0.0,
+            TICK,
+            Some(0.6),
+            Some(0.5),
+        )
+        .is_none());
     }
 
     #[test]
@@ -317,6 +364,8 @@ mod tests {
         assert_eq!(parse_tick("-0.01"), None);
         assert_eq!(parse_tick("abc"), None);
         assert_eq!(parse_tick(""), None);
+        assert_eq!(parse_tick("0.03"), None);
+        assert_eq!(parse_tick("0.00001"), None);
     }
 
     #[test]
@@ -326,26 +375,33 @@ mod tests {
             while fv < 0.99 {
                 // A skipped tick is a legitimate outcome near the band edges;
                 // what must never happen is an off-grid or crossed price.
-                if let Some(s) = quote_from_fair_value(
-                    Side::Up, 0.08, 90, fv, 0.04, 0.0, tick, None, None,
-                ) {
+                if let Some(s) =
+                    quote_from_fair_value(Side::Up, 0.08, 90, fv, 0.04, 0.0, tick, None, None)
+                {
                     for price in [s.our_bid, s.our_ask] {
                         let steps = price / tick;
                         assert!(
                             (steps - steps.round()).abs() < 1e-6,
                             "price {} is off the {} grid (fv={})",
-                            price, tick, fv
+                            price,
+                            tick,
+                            fv
                         );
                         assert!(
                             (MIN_QUOTE..=MAX_QUOTE).contains(&price),
                             "price {} outside the tradeable band (tick={}, fv={})",
-                            price, tick, fv
+                            price,
+                            tick,
+                            fv
                         );
                     }
                     assert!(
                         s.our_bid < s.our_ask,
                         "crossed quote {} / {} (tick={}, fv={})",
-                        s.our_bid, s.our_ask, tick, fv
+                        s.our_bid,
+                        s.our_ask,
+                        tick,
+                        fv
                     );
                 }
                 fv += 0.0037;

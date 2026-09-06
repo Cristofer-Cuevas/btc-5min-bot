@@ -31,7 +31,7 @@ pub fn evaluate_entry(
     }
 
     let (bn_current, bn_open) = match (binance.current_price, binance.window_open_price) {
-        (Some(c), Some(o)) => (c, o),
+        (Some(c), Some(o)) if c.is_finite() && o.is_finite() && c > 0.0 && o > 0.0 => (c, o),
         _ => {
             r.rejection_reason = "no_binance_price";
             return r;
@@ -82,6 +82,11 @@ pub fn evaluate_entry(
     // Single source of truth for what the delta history records, so momentum
     // is always measured on the series that actually drives entries.
     r.decision_delta = Some(decision_delta);
+
+    if !is_fresh(binance.last_update_ms, now_ms as u64, config.max_price_age_ms) {
+        r.rejection_reason = "binance_stale";
+        return r;
+    }
 
     if decision_delta.abs() < config.btc_threshold_pct {
         r.rejection_reason = "below_threshold";
@@ -192,6 +197,15 @@ pub fn evaluate_entry(
     r.bid_price = book.best_bid;
     r.ask_depth = book.ask_depth;
 
+    if !is_fresh(book.last_update_ms, now_ms as u64, config.max_book_age_ms) {
+        r.rejection_reason = "book_stale";
+        return r;
+    }
+    if !ask_price.is_finite() || book.best_bid.is_some_and(|b| !b.is_finite() || b <= 0.0 || b >= ask_price) {
+        r.rejection_reason = "invalid_book";
+        return r;
+    }
+
     if ask_price >= config.max_ask_price {
         debug!(
             "{} ask ${:.2} >= max ${:.2}",
@@ -228,9 +242,14 @@ pub fn evaluate_entry(
     // Fillable depth at our actual limit, not total book depth. Total depth
     // is misleading — size resting above our limit can't fill our order.
     // An empty/unpopulated ladder returns 0.0 and correctly fails this gate.
-    let limit_price = ask_price + config.max_slippage;
+    let limit_price = match crate::trading::buy_limit_price(
+        ask_price, config.max_slippage, config.max_ask_price, &window.tick_size,
+    ) {
+        Ok(p) => p,
+        Err(_) => { r.rejection_reason = "invalid_limit"; return r; }
+    };
     let fillable = book.ask_depth_up_to(limit_price);
-    if fillable < MIN_ASK_DEPTH {
+    if !fillable.is_finite() || fillable < MIN_ASK_DEPTH.max(config.bet_shares) {
         debug!(
             "{} fillable depth {:.0} at limit ${:.2} < min {:.0}",
             side, fillable, limit_price, MIN_ASK_DEPTH
@@ -264,6 +283,22 @@ pub fn evaluate_entry(
     r
 }
 
+fn is_fresh(observed_ms: u64, now_ms: u64, max_age_ms: u64) -> bool {
+    observed_ms > 0 && observed_ms <= now_ms && now_ms - observed_ms <= max_age_ms
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::is_fresh;
+    #[test]
+    fn missing_stale_and_future_observations_are_rejected() {
+        assert!(!is_fresh(0, 10_000, 2_000));
+        assert!(!is_fresh(7_999, 10_000, 2_000));
+        assert!(!is_fresh(10_001, 10_000, 2_000));
+        assert!(is_fresh(8_000, 10_000, 2_000));
+    }
+}
+
 #[cfg(test)]
 mod strike_mode_tests {
     use super::*;
@@ -292,6 +327,11 @@ mod strike_mode_tests {
             poly_proxy_address: String::new(),
             db_path: ":memory:".into(),
             dry_run: true,
+            taker_enabled: false,
+            max_trade_cost_usdc: 5.0,
+            max_open_cost_usdc: 10.0,
+            max_book_age_ms: 2000,
+            max_price_age_ms: 2000,
             // Fixtures keep the original change-only logging so they exercise
             // the taker path exactly as it shipped.
             signal_log_cadence_ms: 0,
@@ -311,6 +351,7 @@ mod strike_mode_tests {
     /// Spot delta of +0.20% (well past the 0.07% threshold).
     fn binance_up() -> BinanceBtcPrice {
         BinanceBtcPrice {
+            last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
             current_price: Some(65_130.0),
             window_open_price: Some(65_000.0),
             ..Default::default()
@@ -725,6 +766,8 @@ mod strike_mode_tests {
             ask_depth: Some(500.0),
             bid_depth: Some(500.0),
             ask_levels: vec![(0.50, 300.0), (0.51, 300.0)],
+            last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
+            ..Default::default()
         }
     }
 
@@ -809,6 +852,7 @@ mod strike_mode_tests {
     #[test]
     fn shadow_mode_threshold_uses_spot_delta() {
         let flat_spot = BinanceBtcPrice {
+            last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
             current_price: Some(65_000.65), // +0.001%, under the 0.07% threshold
             window_open_price: Some(65_000.0),
             ..Default::default()
@@ -922,6 +966,11 @@ mod shadow_isolation_tests {
             poly_proxy_address: String::new(),
             db_path: ":memory:".into(),
             dry_run: true,
+            taker_enabled: false,
+            max_trade_cost_usdc: 5.0,
+            max_open_cost_usdc: 10.0,
+            max_book_age_ms: 2000,
+            max_price_age_ms: 2000,
             // Fixtures keep the original change-only logging so they exercise
             // the taker path exactly as it shipped.
             signal_log_cadence_ms: 0,
@@ -946,6 +995,7 @@ mod shadow_isolation_tests {
                 ask_depth: Some(500.0),
                 bid_depth: Some(500.0),
                 ask_levels: vec![(0.62, 400.0), (0.63, 400.0)],
+                last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
                 ..Default::default()
             },
             down_book: TokenBook {
@@ -954,11 +1004,13 @@ mod shadow_isolation_tests {
                 ask_depth: Some(500.0),
                 bid_depth: Some(500.0),
                 ask_levels: vec![(0.38, 400.0)],
+                last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
                 ..Default::default()
             },
             ..Default::default()
         };
         let bn = BinanceBtcPrice {
+            last_update_ms: chrono::Utc::now().timestamp_millis() as u64,
             current_price: Some(65_130.0),
             window_open_price: Some(65_000.0),
             ..Default::default()

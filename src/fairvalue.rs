@@ -46,11 +46,10 @@ impl Side {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Cell {
-    /// Number of observation ROWS in this cell. Governs the low-confidence
-    /// gate. Note these are not independent samples — see `w`.
+    /// Number of observation rows, retained for diagnostics, not confidence.
     pub n: i64,
-    /// Distinct windows contributing to this cell. Carried for diagnostics:
-    /// `n` double-counts windows that produced several signal rows.
+    /// Distinct resolved windows contributing to this cell. Repeated rows
+    /// within one outcome must never manufacture independent evidence.
     #[serde(default)]
     pub w: i64,
     /// Isotonic-fitted P(Up resolves) for this cell.
@@ -70,12 +69,27 @@ pub struct FairValueModel {
     /// Half-open secs_left bucket edges; `secs_edges.len() - 1` buckets.
     pub secs_edges: Vec<i64>,
     pub min_n: i64,
+    /// Minimum independent windows. Legacy v1 files use min_n for this gate.
+    #[serde(default)]
+    pub min_windows: Option<i64>,
+    #[serde(default)]
+    pub feature: Option<String>,
     /// `grid[secs_bucket][delta_bucket]`.
     pub grid: Vec<Vec<Cell>>,
 }
 
 /// Process-wide model, set once at startup by [`init`].
 static MODEL: OnceLock<FairValueModel> = OnceLock::new();
+
+/// Use the feature the model was fitted on, regardless of taker mode.
+pub fn input_delta(spot: Option<f64>, twap: Option<f64>, use_twap: bool) -> Option<f64> {
+    match MODEL.get()?.feature.as_deref() {
+        Some("twap_delta_pct") => twap,
+        Some("spot_delta_pct") => spot,
+        Some("decision_delta") | None => if use_twap { twap } else { spot },
+        _ => None,
+    }
+}
 
 /// Load, validate and install the process-wide fair-value model.
 ///
@@ -132,7 +146,10 @@ impl FairValueModel {
     /// Structural and semantic checks. Every one of these failing means the
     /// curve cannot be priced against safely.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 {
+        if self.feature.as_deref().is_some_and(|f| !matches!(f, "twap_delta_pct" | "spot_delta_pct" | "decision_delta")) {
+            return Err("unsupported model feature".into());
+        }
+        if self.version != 1 && self.version != 2 {
             return Err(format!("unsupported version {}", self.version));
         }
         if self.reference_side != "Up" {
@@ -140,6 +157,23 @@ impl FairValueModel {
                 "reference_side must be \"Up\", got \"{}\"",
                 self.reference_side
             ));
+        }
+        if self.min_n <= 0 || self.min_windows.is_some_and(|w| w <= 0) {
+            return Err("minimum sample/window counts must be positive".into());
+        }
+        if self.version == 2 && self.min_windows.is_none() {
+            return Err("version 2 requires min_windows".into());
+        }
+        if self
+            .delta_edges
+            .iter()
+            .chain(&self.delta_centers)
+            .any(|v| !v.is_finite())
+        {
+            return Err("delta edges and centers must be finite".into());
+        }
+        if self.delta_edges.windows(2).any(|w| w[1] <= w[0]) {
+            return Err("delta_edges must be strictly increasing".into());
         }
         let n_delta = self.delta_edges.len() + 1;
         if self.delta_centers.len() != n_delta {
@@ -167,6 +201,13 @@ impl FairValueModel {
                     "delta_centers not strictly increasing at index {}: {} -> {}",
                     i, w[0], w[1]
                 ));
+            }
+        }
+        for (i, center) in self.delta_centers.iter().enumerate() {
+            if (i > 0 && *center < self.delta_edges[i - 1])
+                || (i < self.delta_edges.len() && *center >= self.delta_edges[i])
+            {
+                return Err(format!("delta center {} is outside its bucket", i));
             }
         }
         for (i, w) in self.secs_edges.windows(2).enumerate() {
@@ -197,6 +238,9 @@ impl FairValueModel {
                 if c.n < 0 {
                     return Err(format!("grid[{}][{}].n = {} is negative", si, di, c.n));
                 }
+                if c.w < 0 || c.w > c.n {
+                    return Err(format!("grid[{}][{}].w must lie in [0, n]", si, di));
+                }
             }
             // The monotonicity invariant the offline fit is supposed to
             // enforce. Re-checked here so a hand-edited or stale file cannot
@@ -226,12 +270,16 @@ impl FairValueModel {
                 c.total_cells += 1;
                 c.total_rows += cell.n;
                 c.total_windows += cell.w;
-                if !cell.low_conf && cell.n >= self.min_n {
+                if self.usable(cell) {
                     c.usable_cells += 1;
                 }
             }
         }
         c
+    }
+
+    fn usable(&self, cell: &Cell) -> bool {
+        !cell.low_conf && cell.n >= self.min_n && cell.w >= self.min_windows.unwrap_or(self.min_n)
     }
 
     /// Index of the delta bucket containing `delta`. Buckets are [lo, hi).
@@ -259,16 +307,13 @@ impl FairValueModel {
         let row = self.grid.get(si)?;
         let di = self.delta_bucket(delta);
 
-        // The low-confidence gate keys on the cell the input actually falls
-        // in. Interpolation may still reach into a neighbouring thin cell —
-        // after isotonic pooling such a cell's value is already bounded by its
-        // confident neighbours, so it cannot pull the estimate outside the
-        // fitted monotone envelope.
-        if row.get(di)?.low_conf || row[di].n < self.min_n {
+        // Monotonicity alone does not make thin cells reliable. Every cell
+        // contributing nonzero interpolation weight must pass confidence.
+        if !self.usable(row.get(di)?) {
             return None;
         }
 
-        let p_up = self.interpolate(row, di, delta);
+        let p_up = self.interpolate(row, di, delta)?;
         Some(match side {
             Side::Up => p_up,
             Side::Down => 1.0 - p_up,
@@ -278,35 +323,41 @@ impl FairValueModel {
     /// Linear interpolation between the centres of adjacent delta buckets.
     /// Flat outside the first and last centre, where the isotonic fit has
     /// already saturated.
-    fn interpolate(&self, row: &[Cell], di: usize, delta: f64) -> f64 {
+    fn interpolate(&self, row: &[Cell], di: usize, delta: f64) -> Option<f64> {
         let centers = &self.delta_centers;
         let c = centers[di];
+        if (delta - c).abs() < 1e-12 {
+            return Some(row[di].p);
+        }
         // Pick the neighbour on the side the input actually lies toward.
         let (lo, hi) = if delta >= c {
             if di + 1 >= centers.len() {
-                return row[di].p;
+                return Some(row[di].p);
             }
             (di, di + 1)
         } else {
             if di == 0 {
-                return row[di].p;
+                return Some(row[di].p);
             }
             (di - 1, di)
         };
+        if !self.usable(&row[lo]) || !self.usable(&row[hi]) {
+            return None;
+        }
         let (x0, x1) = (centers[lo], centers[hi]);
         let (y0, y1) = (row[lo].p, row[hi].p);
         if (x1 - x0).abs() < f64::EPSILON {
-            return y0;
+            return Some(y0);
         }
         let t = ((delta - x0) / (x1 - x0)).clamp(0.0, 1.0);
-        y0 + t * (y1 - y0)
+        Some(y0 + t * (y1 - y0))
     }
 }
 
 /// Fair probability that `side` wins, given the current signed decision
 /// delta and seconds remaining. Interpolates linearly between adjacent
 /// delta buckets within the same secs_left bucket. Returns None if the
-/// inputs fall in a low-confidence cell (n < 20).
+/// an input or an interpolation neighbour lacks enough distinct windows.
 ///
 /// Also returns None when no model is installed, so callers cannot
 /// accidentally price against an uninitialised curve.
@@ -394,6 +445,55 @@ mod tests {
     }
 
     #[test]
+    fn repeated_rows_cannot_pass_independent_window_gate() {
+        let mut m = model();
+        m.grid[0][2].n = 10_000;
+        m.grid[0][2].w = 1;
+        m.grid[0][2].low_conf = false;
+        assert_eq!(m.fair_value(Side::Up, 0.05, 30), None);
+        assert_eq!(m.coverage().usable_cells, 10);
+    }
+
+    #[test]
+    fn interpolation_never_borrows_probability_from_a_thin_neighbor() {
+        let m = model();
+        assert_eq!(m.fair_value(Side::Up, 0.025, 90), None);
+        assert_eq!(m.fair_value(Side::Up, -0.11, 90), None);
+        // Exact centers use no weight from the neighboring cell.
+        assert_eq!(m.fair_value(Side::Up, 0.05, 90), Some(0.60));
+    }
+
+    #[test]
+    fn malformed_axes_and_window_counts_are_rejected() {
+        let mut m = model();
+        m.delta_edges[0] = f64::NAN;
+        assert!(m.validate().is_err());
+        let mut m = model();
+        m.delta_edges.swap(0, 1);
+        assert!(m.validate().is_err());
+        let mut m = model();
+        m.delta_centers[0] = 0.0;
+        assert!(m.validate().is_err());
+        let mut m = model();
+        m.grid[0][0].w = 101;
+        assert!(m.validate().is_err());
+        let mut m = model();
+        m.min_n = 0;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn v2_requires_and_uses_independent_window_threshold() {
+        let mut m = model();
+        m.version = 2;
+        assert!(m.validate().is_err());
+        m.min_windows = Some(51);
+        m.validate().unwrap();
+        assert_eq!(m.fair_value(Side::Up, 0.05, 30), None);
+        assert_eq!(m.coverage().usable_cells, 0);
+    }
+
+    #[test]
     fn secs_left_outside_range_returns_none() {
         let m = model();
         assert_eq!(m.fair_value(Side::Up, 0.05, -1), None);
@@ -469,8 +569,8 @@ mod tests {
 
     #[test]
     fn load_missing_file_is_an_error_not_a_fallback() {
-        let err = load("definitely-not-a-real-fairvalue-file.json")
-            .expect_err("missing file must fail");
+        let err =
+            load("definitely-not-a-real-fairvalue-file.json").expect_err("missing file must fail");
         assert!(err.contains("cannot read"), "unexpected error: {}", err);
     }
 
@@ -506,9 +606,15 @@ mod shipped_curve_tests {
             "coverage: {}/{} cells usable, {} rows, {} cell-window obs",
             c.usable_cells, c.total_cells, c.total_rows, c.total_windows
         );
-        assert!(c.usable_cells > 0, "no usable cells: the bot could never quote");
+        assert!(
+            c.usable_cells > 0,
+            "no usable cells: the bot could never quote"
+        );
 
-        println!("\n{:>6}  {:>8}  {:>10}  {:>10}", "secs", "delta", "P(Up)", "P(Down)");
+        println!(
+            "\n{:>6}  {:>8}  {:>10}  {:>10}",
+            "secs", "delta", "P(Up)", "P(Down)"
+        );
         let mut priced = 0;
         for secs in [15, 45, 75, 105, 150, 210, 270] {
             for delta in [-0.20, -0.12, -0.08, -0.06, 0.0, 0.06, 0.08, 0.12, 0.20] {
@@ -531,7 +637,10 @@ mod shipped_curve_tests {
             }
         }
         println!("\npriced {} of {} probe points", priced, 7 * 9);
-        assert!(priced > 0, "the curve priced nothing at any realistic state");
+        assert!(
+            priced > 0,
+            "the curve priced nothing at any realistic state"
+        );
 
         // Monotonicity holds across the interpolated curve, not just the cells.
         for secs in [15, 45, 75, 105, 150, 210, 270] {

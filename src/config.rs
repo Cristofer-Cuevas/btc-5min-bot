@@ -39,6 +39,12 @@ pub struct RuntimeConfig {
     // Operational
     pub db_path: String,
     pub dry_run: bool,
+    /// Explicit opt-in to the experimental taker strategy. Collection continues when false.
+    pub taker_enabled: bool,
+    pub max_trade_cost_usdc: f64,
+    pub max_open_cost_usdc: f64,
+    pub max_book_age_ms: u64,
+    pub max_price_age_ms: u64,
 
     /// How often to log a `signals` row while the rejection reason is
     /// unchanged, in milliseconds. 0 disables the cadence, restoring the
@@ -105,22 +111,22 @@ impl RuntimeConfig {
             .parse()
             .map_err(|_| "TELEGRAM_CHAT_ID must be a number".to_string())?;
 
-        let btc_threshold_pct = env::var("BTC_THRESHOLD_PCT")
+        let btc_threshold_pct: f64 = env::var("BTC_THRESHOLD_PCT")
             .unwrap_or_else(|_| "0.07".into())
             .parse()
             .unwrap_or(0.07);
 
-        let max_ask_price = env::var("MAX_ASK_PRICE")
+        let max_ask_price: f64 = env::var("MAX_ASK_PRICE")
             .unwrap_or_else(|_| "0.80".into())
             .parse()
             .unwrap_or(0.80);
 
-        let max_spread = env::var("MAX_SPREAD")
+        let max_spread: f64 = env::var("MAX_SPREAD")
             .unwrap_or_else(|_| "0.10".into())
             .parse()
             .unwrap_or(0.10);
 
-        let bet_shares = env::var("BET_SHARES")
+        let bet_shares: f64 = env::var("BET_SHARES")
             .unwrap_or_else(|_| "5".into())
             .parse()
             .unwrap_or(5.0);
@@ -189,10 +195,32 @@ impl RuntimeConfig {
 
         let poly_proxy_address = env::var("POLY_PROXY_ADDRESS").unwrap_or_default();
 
-        let dry_run = env::var("DRY_RUN")
-            .unwrap_or_else(|_| "true".into())
-            .to_lowercase()
-            == "true";
+        let dry_run = env_bool("DRY_RUN", true)?;
+
+        let taker_enabled = env_bool("TAKER_ENABLED", false)?;
+        let max_trade_cost_usdc = positive_env("MAX_TRADE_COST_USDC", 5.0)?;
+        let max_open_cost_usdc = positive_env("MAX_OPEN_COST_USDC", 10.0)?;
+        let max_book_age_ms = positive_env("MAX_BOOK_AGE_MS", 2000.0)? as u64;
+        let max_price_age_ms = positive_env("MAX_PRICE_AGE_MS", 2000.0)? as u64;
+        if max_book_age_ms == 0 || max_price_age_ms == 0 {
+            return Err("Feed freshness limits must be at least 1ms".into());
+        }
+        for (name, value) in [
+            ("BTC_THRESHOLD_PCT", btc_threshold_pct),
+            ("MAX_ASK_PRICE", max_ask_price),
+            ("MAX_SPREAD", max_spread),
+            ("BET_SHARES", bet_shares),
+            ("DAILY_LOSS_LIMIT_USDC", daily_loss_limit_usdc),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} must be finite and positive"));
+            }
+        }
+        if max_ask_price >= 1.0 || max_spread >= 1.0 || bet_shares < 5.0
+            || max_consecutive_losses < 1 || max_trade_cost_usdc > max_open_cost_usdc
+        {
+            return Err("Invalid price, share, or risk limits".into());
+        }
 
         // Defaults to false: only an explicit "true" opts in.
         let use_twap_strike = env::var("USE_TWAP_STRIKE")
@@ -321,6 +349,11 @@ impl RuntimeConfig {
             poly_proxy_address,
             db_path,
             dry_run,
+            taker_enabled,
+            max_trade_cost_usdc,
+            max_open_cost_usdc,
+            max_book_age_ms,
+            max_price_age_ms,
             use_twap_strike,
             signal_log_cadence_ms,
             maker_mode,
@@ -343,4 +376,73 @@ impl RuntimeConfig {
             && !self.poly_api_key.is_empty()
             && !self.poly_api_secret.is_empty()
     }
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool, String> {
+    match env::var(name) {
+        Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(format!("{name} must be true or false")),
+        },
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+fn positive_env(name: &str, default: f64) -> Result<f64, String> {
+    let value = match env::var(name) {
+        Ok(s) => s.parse::<f64>().map_err(|_| format!("{name} must be a number"))?,
+        Err(env::VarError::NotPresent) => default,
+        Err(e) => return Err(format!("{name}: {e}")),
+    };
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{name} must be finite and positive"));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+pub(crate) fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            poly_private_key: String::new(),
+            poly_address: String::new(),
+            poly_api_key: String::new(),
+            poly_api_secret: String::new(),
+            poly_api_passphrase: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: 0,
+            btc_threshold_pct: 0.07,
+            max_ask_price: 0.80,
+            max_spread: 0.10,
+            bet_shares: 5.0,
+            max_slippage: 0.03,
+            min_trend_strength: 0.41,
+            // Disabled by default in fixtures so pre-existing tests exercise
+            // the gates they were written for; momentum tests opt in.
+            min_delta_momentum: 0.0,
+            max_consecutive_losses: 3,
+            daily_loss_limit_usdc: 20.0,
+            poly_proxy_address: String::new(),
+            db_path: ":memory:".into(),
+            dry_run: true,
+            taker_enabled: false,
+            max_trade_cost_usdc: 5.0,
+            max_open_cost_usdc: 10.0,
+            max_book_age_ms: 2000,
+            max_price_age_ms: 2000,
+            // Fixtures keep the original change-only logging so they exercise
+            // the taker path exactly as it shipped.
+            signal_log_cadence_ms: 0,
+            use_twap_strike: false,
+            // The taker fixtures must exercise the taker path exactly as it
+            // shipped: maker mode OFF, so no fair-value model is consulted.
+            maker_mode: crate::maker::MakerMode::Off,
+            fairvalue_path: String::new(),
+            maker_half_spread: 0.04,
+            chainlink_api_key: String::new(),
+            chainlink_api_secret: String::new(),
+            chainlink_stream_id: String::new(),
+            use_chainlink_fallback: false,
+        }
 }

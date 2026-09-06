@@ -25,6 +25,13 @@ pub async fn run_binance_feed(binance_price: SharedBinancePrice) {
                 );
             }
         }
+        {
+            let mut state = binance_price.write().await;
+            state.current_price = None;
+            state.last_update_ms = 0;
+            // Do not treat a disconnected interval as a continuous trend/TWAP.
+            state.price_buffer.clear();
+        }
         tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
@@ -38,7 +45,17 @@ async fn connect_and_listen(binance_price: &SharedBinancePrice) -> Result<(), St
     info!("Binance WebSocket connected");
     let (mut write, mut read) = ws_stream.split();
 
-    while let Some(msg_result) = read.next().await {
+    loop {
+        let msg_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(30), read.next(),
+        ).await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(_) => {
+                warn!("Binance feed silent for 30s; reconnecting");
+                break;
+            }
+        };
         match msg_result {
             Ok(Message::Text(text)) => {
                 handle_binance_message(&text, binance_price).await;
@@ -87,7 +104,14 @@ async fn handle_binance_message(text: &str, binance_price: &SharedBinancePrice) 
     };
 
     let ts = trade.trade_time.unwrap_or(0);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    if !value.is_finite() || value <= 0.0 || ts == 0 || ts > now.saturating_add(1_000) {
+        return;
+    }
     let mut state = binance_price.write().await;
+    if ts < state.last_update_ms {
+        return;
+    }
     state.current_price = Some(value);
     state.last_update_ms = ts;
 

@@ -7,6 +7,8 @@ mod fairvalue;
 mod maker;
 mod market_ws;
 mod rtds;
+mod risk;
+mod recorder;
 mod strategy;
 mod telegram;
 mod trading;
@@ -159,7 +161,10 @@ async fn main() {
         .init();
 
     info!("Polymarket BTC 5-min bot starting (version {})", BOT_VERSION);
-    info!("DRY_RUN = {}", cfg.dry_run);
+    info!("DRY_RUN = {}, TAKER_ENABLED = {}", cfg.dry_run, cfg.taker_enabled);
+    if !cfg.taker_enabled {
+        warn!("Collection only: no taker orders. Historical results do not establish a profitable strategy.");
+    }
 
     // ── 2. Parse wallet once at startup ──
     let wallet: SharedWallet = if !cfg.poly_private_key.is_empty() {
@@ -234,12 +239,14 @@ async fn main() {
     let token_window_map: SharedTokenWindowMap = Arc::new(RwLock::new(HashMap::new()));
     let start_time = std::time::Instant::now();
 
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build().expect("HTTP client configuration");
 
     // ── 5. Build authenticated SDK client once (live mode only) ──
     let sdk_client: Option<SharedSdkClient> = {
         let cfg_ref = shared_config.read().await;
-        if !cfg_ref.dry_run && cfg_ref.has_trading_credentials() {
+        if cfg_ref.taker_enabled && !cfg_ref.dry_run && cfg_ref.has_trading_credentials() {
             info!("Building authenticated SDK client...");
             match trading::build_shared_sdk_client(&cfg_ref).await {
                 Ok(c) => {
@@ -287,8 +294,11 @@ async fn main() {
 
     // ── 9. Spawn CLOB WebSocket (market data) ──
     let market_state_ws = market_state.clone();
+    let tape = if std::env::var("CAPTURE_MARKET_EVENTS").as_deref() == Ok("true") {
+        Some(recorder::start(db.clone()))
+    } else { None };
     tokio::spawn(async move {
-        market_ws::run_clob_ws(market_state_ws, clob_cmd_rx, resolution_tx).await;
+        market_ws::run_clob_ws(market_state_ws, clob_cmd_rx, resolution_tx, tape).await;
     });
 
     // ── 10. Spawn Telegram bot ──
@@ -425,7 +435,7 @@ async fn main() {
             {
                 let mut ws = window_state.write().await;
                 ws.window_ts = current_ts;
-                ws.entered = false;
+                ws.entered = db.get_trade_by_window_ts(current_ts as i64).is_some();
                 ws.failed_attempts = 0;
                 ws.last_signal_reason = None;
                 ws.market = None;
@@ -486,7 +496,11 @@ async fn main() {
             // Record window open price (RTDS/Chainlink)
             {
                 let mut btc = btc_price.write().await;
-                btc.window_open_price = btc.current_price;
+                btc.window_open_price = if now_ms >= current_ts as i64 * 1000
+                    && now_ms - current_ts as i64 * 1000 <= 2000
+                    && btc.last_update_ms > 0 && btc.last_update_ms <= now_ms as u64
+                    && now_ms as u64 - btc.last_update_ms <= RTDS_STALE_MS
+                { btc.current_price } else { None };
                 if let Some(p) = btc.window_open_price {
                     info!("Window open BTC price (RTDS): ${:.2}", p);
                 }
@@ -495,7 +509,13 @@ async fn main() {
             // Record window open price (Binance)
             {
                 let mut bn = binance_price.write().await;
-                bn.window_open_price = bn.current_price;
+                // A mid-window restart cannot manufacture the opening strike
+                // from its first observed price. Wait for a complete window.
+                bn.window_open_price = if now_ms >= current_ts as i64 * 1000
+                    && now_ms - current_ts as i64 * 1000 <= 2000
+                    && bn.last_update_ms > 0 && bn.last_update_ms <= now_ms as u64
+                    && now_ms as u64 - bn.last_update_ms <= 2000
+                { bn.current_price } else { None };
                 if let Some(p) = bn.window_open_price {
                     info!("Window open BTC price (Binance): ${:.2}", p);
                 }
@@ -583,7 +603,8 @@ async fn main() {
             let strike = match fresh.as_ref() {
                 Some((value, observed, source)) => {
                     let skew_ms = *observed - boundary_ms;
-                    if *observed < boundary_ms - TWAP_STRIKE_LOOKBACK_TOLERANCE_MS {
+                    if *observed < boundary_ms - TWAP_STRIKE_LOOKBACK_TOLERANCE_MS
+                        || *observed > boundary_ms + 2000 || now_ms > boundary_ms + 2000 {
                         warn!(
                             "Strike REJECTED (pre-boundary): window={} feed_observed_ms={} \
                              boundary_ms={} skew_ms={} exceeds tolerance -{}ms; storing None",
@@ -621,7 +642,7 @@ async fn main() {
                 ws.twap_strike = strike.as_ref().map(|(v, _)| v.clone());
                 ws.twap_strike_observed_ms = strike.as_ref().map(|(_, obs)| *obs);
                 // SHADOW ONLY.
-                ws.binance_twap_strike = binance_twap_open;
+                ws.binance_twap_strike = binance_twap_open.filter(|_| now_ms <= boundary_ms + 2000);
                 ws.binance_twap_strike_ms = binance_twap_open.map(|_| now_ms);
             }
 
@@ -756,161 +777,33 @@ async fn main() {
             }
         }
 
-        // ── Retry check (before strategy evaluation) ──
-        // If a prior attempt left a pending retry signal and conditions allow,
-        // build a refreshed signal from CURRENT book state and use it instead
-        // of running strategy. Retry takes precedence over strategy evaluation.
-        let retry_signal_opt: Option<EntrySignal> = {
-            let pending = {
-                let ws = window_state.read().await;
-                ws.pending_retry_signal.clone()
-            };
-            if let Some(pending) = pending {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let (cooldown_elapsed, attempts, entered, paused) = {
-                    let ws = window_state.read().await;
-                    let cooldown_elapsed = match ws.last_attempt_failed_at_ms {
-                        Some(t) => now_ms - t >= 3000,
-                        None => true,
-                    };
-                    (cooldown_elapsed, ws.failed_attempts, ws.entered, ws.paused)
-                };
-                let resolved = market_state.read().await.resolved;
-
-                let can_retry = cooldown_elapsed
-                    && secs_left >= 30
-                    && attempts < MAX_ENTRY_ATTEMPTS
-                    && !entered
-                    && !paused
-                    && !resolved;
-
-                if !can_retry {
-                    if attempts >= MAX_ENTRY_ATTEMPTS {
-                        warn!(
-                            "Retry budget exhausted ({}), abandoning entry for window {}",
-                            MAX_ENTRY_ATTEMPTS, current_ts
-                        );
-                        let mut ws = window_state.write().await;
-                        ws.pending_retry_signal = None;
-                    }
-                    None
-                } else {
-                    // Re-derive limit price from CURRENT book — ask may have moved.
-                    let (current_ask_opt, current_spread) = {
-                        let ms = market_state.read().await;
-                        let book = if pending.side == "Up" {
-                            &ms.up_book
-                        } else {
-                            &ms.down_book
-                        };
-                        (book.best_ask, book.spread().unwrap_or(0.0))
-                    };
-                    let max_ask_price = shared_config.read().await.max_ask_price;
-
-                    match current_ask_opt {
-                        None => None, // book has no ask this tick; try next tick
-                        Some(ask) if ask >= max_ask_price => {
-                            info!(
-                                "Retry abandoned: market moved past MAX_ASK_PRICE ({:.2} >= {:.2})",
-                                ask, max_ask_price
-                            );
-                            let mut ws = window_state.write().await;
-                            ws.pending_retry_signal = None;
-                            None
-                        }
-                        Some(ask) => {
-                            info!(
-                                "Retrying entry (attempt {}/{}): {} @ current ask ${:.2}",
-                                attempts + 1,
-                                MAX_ENTRY_ATTEMPTS,
-                                pending.side,
-                                ask
-                            );
-                            Some(EntrySignal {
-                                side: pending.side.clone(),
-                                token_id: pending.token_id.clone(),
-                                btc_delta_pct: pending.btc_delta_pct,
-                                ask_price: ask,
-                                spread: current_spread,
-                                secs_left,
-                            })
-                        }
-                    }
-                }
-            } else {
-                None
-            }
-        };
-
-        // ── Strategy evaluation (skipped if retry took precedence) ──
+        // Every attempt re-evaluates current direction, prices, depth and risk.
+        // A prior rejection supplies only a cooldown; it never replays a stale signal.
         let signal_detected_ms = chrono::Utc::now().timestamp_millis();
-        let is_retry = retry_signal_opt.is_some();
-
-        let (eval_result, dry_run_flag) = if let Some(retry_sig) = retry_signal_opt {
-            let dry_run = shared_config.read().await.dry_run;
-            let r = EvaluationResult {
-                signal: Some(retry_sig.clone()),
-                rejection_reason: "entered",
-                btc_delta_pct: Some(retry_sig.btc_delta_pct),
-                ask_price: Some(retry_sig.ask_price),
-                bid_price: None,
-                spread: Some(retry_sig.spread),
-                ask_depth: None,
-                trade_count: None,
-                trend_strength: None,
-                side: Some(retry_sig.side),
-                // A retry replays the signal that already passed every gate;
-                // no fresh evaluation runs, so there is no new TWAP delta to
-                // record. None rather than a re-derived or stale value. The
-                // shadow context still supplies the Binance figures at write
-                // time, so the row is not left empty.
-                twap_delta_pct: None,
-                binance_twap_delta_pct: None,
-                // A retry replays a signal that already cleared the momentum
-                // gate; no fresh measurement is taken, so nothing is recorded
-                // and nothing is pushed into the delta history.
-                decision_delta: None,
-                delta_momentum: None,
-                delta_past_value: None,
-                delta_past_age_ms: None,
-            };
-            (r, dry_run)
-        } else {
+        let is_retry = window_state.read().await.failed_attempts > 0;
+        let (eval_result, dry_run_flag) = {
             let ws = window_state.read().await;
             let cfg = shared_config.read().await;
             let btc = btc_price.read().await;
             let bn = binance_price.read().await;
             let ms = market_state.read().await;
-
-            let dry_run = cfg.dry_run;
-
+            let cooling_down = ws.last_attempt_failed_at_ms
+                .map(|t| signal_detected_ms - t < 3000).unwrap_or(false);
             let result = if ws.paused {
                 EvaluationResult::rejected("paused")
             } else if ws.entered {
                 EvaluationResult::rejected("already_entered")
             } else if ws.failed_attempts >= MAX_ENTRY_ATTEMPTS {
                 EvaluationResult::rejected("max_attempts")
+            } else if cooling_down {
+                EvaluationResult::rejected("retry_cooldown")
             } else if let Some(market) = ws.market.as_ref() {
-                if ms.resolved {
-                    EvaluationResult::rejected("market_resolved")
-                } else {
-                    strategy::evaluate_entry(
-                        &cfg,
-                        &btc,
-                        &bn,
-                        &ms,
-                        market,
-                        secs_left,
-                        ws.twap_strike.as_deref(),
-                        ws.binance_twap_strike,
-                        &ws,
-                    )
-                }
+                strategy::evaluate_entry(&cfg, &btc, &bn, &ms, market, secs_left,
+                    ws.twap_strike.as_deref(), ws.binance_twap_strike, &ws)
             } else {
                 EvaluationResult::rejected("no_market")
             };
-
-            (result, dry_run)
+            (result, cfg.dry_run)
         };
 
         // Record the decision delta for momentum measurement. Pushed AFTER the
@@ -952,12 +845,26 @@ async fn main() {
         // `maker_shadow`. Runs AFTER the evaluation and the delta-history
         // update above so it cannot influence either.
         if maker_mode != maker::MakerMode::Off {
-            // Every input is read-only. `decision_delta` and `side` come from
-            // the evaluation that already happened; no gate consults the result.
-            if let (Some(delta), Some(side_str)) =
-                (eval_result.decision_delta, eval_result.side.as_deref())
-            {
-                if let Some(side) = fairvalue::Side::parse(side_str) {
+            // Maker diagnostics continue while the taker is paused or disabled.
+            // Both outcomes are priced from the model's own feature definition.
+            let strike = window_state.read().await.twap_strike.clone();
+            let twap_delta = {
+                let btc = btc_price.read().await;
+                btc.fresh_twap_30(now_ms, TWAP_MAX_AGE_MS).and_then(|(value, _)|
+                    strike.as_deref().and_then(|strike| types::twap_delta_pct(strike, &value)))
+            };
+            let spot_delta = {
+                let bn = binance_price.read().await;
+                match (bn.current_price, bn.window_open_price) {
+                    (Some(c), Some(o)) if o > 0.0 && bn.last_update_ms > 0
+                        && bn.last_update_ms <= now_ms as u64
+                        && now_ms as u64 - bn.last_update_ms <= 2000 => Some((c - o) / o * 100.0),
+                    _ => None,
+                }
+            };
+            let use_twap = shared_config.read().await.use_twap_strike;
+            if let Some(delta) = fairvalue::input_delta(spot_delta, twap_delta, use_twap) {
+                for side in [fairvalue::Side::Up, fairvalue::Side::Down] {
                     let tick = {
                         let ws = window_state.read().await;
                         ws.market.as_ref().and_then(|m| maker::parse_tick(&m.tick_size))
@@ -975,6 +882,10 @@ async fn main() {
                             } else {
                                 &ms.down_book
                             };
+                            if book.last_update_ms == 0 || book.last_update_ms > now_ms as u64
+                                || now_ms as u64 - book.last_update_ms > 2000 {
+                                continue;
+                            }
                             (book.best_bid, book.best_ask)
                         };
 
@@ -1092,7 +1003,11 @@ async fn main() {
             }
         }
 
-        if let Some(ref signal) = eval_result.signal {
+        let taker_enabled = shared_config.read().await.taker_enabled;
+        if let Some(signal) = eval_result.signal.as_ref().filter(|_| taker_enabled) {
+            if discovery::current_window_ts() != current_ts || discovery::secs_remaining() < 30 {
+                continue;
+            }
             if !is_retry {
                 // `signal.btc_delta_pct` is ALWAYS the Binance spot delta, but
                 // the side comes from whichever delta the flag selects. Printing
@@ -1120,7 +1035,7 @@ async fn main() {
                 );
             }
 
-            let cfg = shared_config.read().await;
+            let cfg = shared_config.read().await.clone();
             let shares = cfg.bet_shares;
             let dry_run = cfg.dry_run;
 
@@ -1183,10 +1098,14 @@ async fn main() {
                 (ws.twap_strike.clone(), ws.binance_twap_strike)
             };
 
-            let limit_price = {
-                let raw = signal.ask_price + cfg.max_slippage;
-                let tick = (raw * 100.0).round() / 100.0;
-                tick.clamp(0.02, 0.99)
+            let limit_price = match trading::buy_limit_price(
+                signal.ask_price, cfg.max_slippage, cfg.max_ask_price, &tick_size_val,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Invalid execution price: {}", e);
+                    continue;
+                }
             };
 
             let failed_before = {
@@ -1194,12 +1113,31 @@ async fn main() {
                 ws.failed_attempts
             };
 
+            if !dry_run && sdk_client.is_none() {
+                error!("Live SDK unavailable; pausing entries. Restart with valid live configuration.");
+                window_state.write().await.paused = true;
+                continue;
+            }
+            let attempt_id = if dry_run { None } else {
+                // The submitter enforces this all-in cap using market fee metadata.
+                match db.reserve_live_order(&cfg, current_ts as i64, &signal.token_id, cfg.max_trade_cost_usdc) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        warn!("Live entry blocked: {}", e);
+                        window_state.write().await.paused = true;
+                        db.insert_kill_switch_event(&e, None, None);
+                        continue;
+                    }
+                }
+            };
             let order_sent_ms = chrono::Utc::now().timestamp_millis();
 
             let fill = if dry_run {
-                trading::simulate_trade(signal, shares)
+                let mut conservative_signal = signal.clone();
+                conservative_signal.ask_price = limit_price;
+                trading::simulate_trade(&conservative_signal, shares)
             } else {
-                let sdk = sdk_client.as_ref().expect("SDK client required for live trading");
+                let sdk = sdk_client.as_ref().expect("SDK checked before durable reservation");
                 match trading::place_fak_buy(
                     sdk,
                     &cfg,
@@ -1215,10 +1153,23 @@ async fn main() {
                     Err(e) => {
                         error!("Order placement failed: {}", e);
                         let retriable = trading::is_retriable_error(&e);
+                        if let Some(id) = attempt_id {
+                            let status = if e.starts_with("ORDER_STATE_UNKNOWN:") { "unknown" } else { "rejected" };
+                            if let Err(db_err) = db.finish_order_attempt(id, status, None, Some(&e)) {
+                                error!("Order journal update failed: {}", db_err);
+                                window_state.write().await.paused = true;
+                            }
+                        }
                         let now_ms = chrono::Utc::now().timestamp_millis();
                         let max_reached = {
                             let mut ws = window_state.write().await;
                             ws.failed_attempts += 1;
+                            if !retriable {
+                                // Network errors and delayed acknowledgements can hide an
+                                // accepted order. Never retry without exchange reconciliation.
+                                ws.paused = true;
+                                ws.entered = true;
+                            }
                             ws.last_attempt_failed_at_ms = Some(now_ms);
                             if retriable && ws.failed_attempts < MAX_ENTRY_ATTEMPTS {
                                 ws.pending_retry_signal = Some(signal.clone());
@@ -1258,6 +1209,12 @@ async fn main() {
             // If FAK didn't fill at all (zero shares), don't record a trade.
             // Any partial fill (filled_size > 0) flows through normal recording below.
             if fill.filled_size == 0.0 {
+                if let Some(id) = attempt_id {
+                    if let Err(e) = db.finish_order_attempt(id, "rejected", Some(&fill.order_id), Some("confirmed zero fill")) {
+                        error!("Order journal update failed: {}", e);
+                        window_state.write().await.paused = true;
+                    }
+                }
                 warn!("FAK order {} did not fill, not recording trade", fill.order_id);
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let max_reached = {
@@ -1297,7 +1254,7 @@ async fn main() {
 
             // Record trade with actual fill data
             let now = chrono::Utc::now().timestamp();
-            let actual_cost = fill.fill_price * fill.filled_size;
+            let actual_cost = fill.fill_price * fill.filled_size + fill.fee_estimate_usdc;
             let trade = TradeRecord {
                 timestamp: now,
                 window_ts: current_ts as i64,
@@ -1346,10 +1303,22 @@ async fn main() {
                 binance_twap_delta_at_entry: eval_result.binance_twap_delta_pct,
                 binance_twap_strike_at_entry: binance_twap_strike_entry,
                 delta_momentum_at_entry: eval_result.delta_momentum,
+                fee_estimate_usdc: Some(fill.fee_estimate_usdc),
             };
 
-            if let Err(e) = db.insert_trade(&trade) {
-                error!("Failed to insert trade: {}", e);
+            match db.insert_trade(&trade) {
+                Ok(_) => {
+                    if let Some(id) = attempt_id {
+                        if let Err(e) = db.finish_order_attempt(id, "filled", trade.order_id.as_deref(), None) {
+                            error!("Filled order journal update failed: {}", e);
+                            window_state.write().await.paused = true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Filled trade could not be persisted; reconciliation required: {}", e);
+                    window_state.write().await.paused = true;
+                }
             }
 
             // DATA COLLECTION ONLY: TWAP reading captured when the order was

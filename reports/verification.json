@@ -1,0 +1,24 @@
+{
+  "source_database": "t.db",
+  "source_database_sha256": "4e915a1fedb6c858263d185eb568aeb8a4ac713e4867ab552be60c97eb7052e7",
+  "source_database_bytes": 41529344,
+  "rust": {
+    "passed": 132,
+    "failed": 0,
+    "ignored": 0,
+    "output": "reports/rust-tests.txt",
+    "includes_isolated_database_migration": true
+  },
+  "python_model_tests": {
+    "passed": 8,
+    "failed": 0
+  },
+  "audit_self_tests": "passed",
+  "historical_trade_fields_preserved_on_migration_copy": true,
+  "source_database_modified_by_audit": false,
+  "live_orders_submitted": false,
+  "live_deployment_performed": false,
+  "profitability_demonstrated": false,
+  "windows_test_build": "cargo rustc --tests -- -L native=<workspace>/target/test-native -C link-arg=-Wl,--stack,16777216",
+  "windows_toolchain_note": "Baseline cargo test could not link nanosleep64 because the existing MinGW headers and Rust-bundled pthread library differ. An isolated target/test-native/libpthread.a copied from the installed MinGW library and a 16MiB test-executable stack allowed compilation and execution. No global toolchain settings were changed."
+}

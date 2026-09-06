@@ -1,68 +1,20 @@
 #!/usr/bin/env python3
-"""Build the empirical fair-value curve from the bot's own labelled history.
+"""Fit a diagnostic P(Up | TWAP delta, time) with a chronological holdout.
 
-Standalone analysis tool. NOT part of the bot binary and never imported by it;
-the only contract between the two is the JSON file this writes.
+Default input is the unconditional delta_samples table. Each resolved window
+has one vote per cell, regardless of logging cadence. The newest 25% of whole
+windows are held out; one intervening window is embargoed. The exported model
+is fitted ONLY on the training prefix, including smoothing and isotonic fit.
+Repeated observations never cross the train/test boundary.
 
-WHAT IT ESTIMATES
------------------
-    P(the window resolves "Up" | signed decision delta, seconds remaining)
-
-"Up" is the fixed REFERENCE SIDE. Every probability in the output file is the
-probability that Up wins; the Down price is its complement (1 - p). Fixing one
-reference side is what makes the monotonicity constraint meaningful: P(Up wins)
-must be non-decreasing in the signed delta. Scoring "did the signalled side
-win?" instead would produce a U-shape (both large negative and large positive
-deltas look like wins) and monotonicity would be nonsense.
-
-DATA SOURCE
------------
-`signals` joined to `twap_observations` on window_ts. `signals.decision_delta`
-is the delta that actually drove the threshold and side selection at that
-instant (the TWAP delta under USE_TWAP_STRIKE=true, the spot delta otherwise) --
-i.e. the same quantity the bot will have in hand when it quotes.
-`twap_observations.actual_resolution` is the settled outcome.
-
-SAMPLING -- read before trusting the numbers
---------------------------------------------
-There are TWO sampling regimes in the data, split by when the bot was running
-with SIGNAL_LOG_CADENCE_MS enabled.
-
-BEFORE the cadence (change-only logging): `signals` rows are NOT a uniform time
-sample. The bot wrote a row only when the rejection reason CHANGED, giving
-roughly 2.5 rows per window, all at transition moments. The curve fitted on
-that data is conditioned on "a moment where the evaluation outcome changed",
-while the bot uses it on every tick. Worse, it leaves whole regions unobserved:
-a delta that sits quietly below the entry threshold is logged once and then
-never again, which is why the near-zero delta buckets come out empty.
-
-AFTER the cadence: a row is also written every SIGNAL_LOG_CADENCE_MS (default
-5s) whenever the evaluation produced a decision delta, giving ~60 rows per
-window on a uniform grid. This is the regime the curve should be fitted on.
-
-Use --since to fit on the cadence era only once enough of it has accumulated;
-mixing the two regimes weights transition moments far too heavily.
-
-In both regimes cell counts (`n`) double-count windows: `w` (distinct windows)
-is reported alongside and is the honest independent-sample count.
-
-METHOD
-------
-1. Bucket by (signed delta, secs_left) on the edges below.
-2. Per cell: n rows, w distinct windows, k = rows resolving Up.
-3. Laplace smoothing: p = (k + 1) / (n + 2). Thin cells fall back toward 0.5
-   instead of producing a hard 0.0 or 1.0 off two observations.
-4. Isotonic regression (pool-adjacent-violators) across the delta axis within
-   each secs_left bucket, weighted by (n + 2) -- the effective observation count
-   of the smoothed estimate, so empty cells sit at 0.5 with weight 2 and get
-   overridden by any real data rather than dragging it.
-5. Flag cells with n < MIN_N as low confidence. The bot refuses to quote from
-   them.
+The holdout reports window-weighted probability losses and coverage, including
+comparison with the contemporaneous Up book midpoint on the same observations.
+It does not simulate executions or demonstrate profitability. A market maker
+needs subsequent trade/depth data, arrival/cancel latency and inventory data.
 
 Usage:
-    python tools/build_fairvalue.py [--db trades.db] [--out fairvalue.json]
-                                    [--min-n 20] [--since YYYY-MM-DD]
-                                    [--source signals|delta_samples] [--report]
+  python tools/build_fairvalue.py --db t.db --out reports/fairvalue_candidate.json
+      --validation-out reports/fairvalue_validation.json --report
 """
 
 from __future__ import annotations
@@ -70,8 +22,11 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
+from pathlib import Path
+from collections import defaultdict
+from contextlib import closing
 import sqlite3
-import sys
 import time
 
 # Signed delta bucket edges (percent). 17 interior edges -> 18 buckets, the
@@ -94,10 +49,10 @@ REFERENCE_SIDE = "Up"
 # and (before SIGNAL_LOG_CADENCE_MS) only at moments the rejection reason
 # changed. Fits from this see near-certainties and little else.
 SIGNALS_QUERY = """
-SELECT s.window_ts,
+SELECT s.window_ts, s.timestamp_ms,
        s.decision_delta,
        s.secs_left,
-       t.actual_resolution
+       t.actual_resolution, NULL, NULL
 FROM signals s
 JOIN twap_observations t ON s.window_ts = t.window_ts
 WHERE s.side IS NOT NULL
@@ -113,10 +68,10 @@ WHERE s.side IS NOT NULL
 #
 # No join is needed: the sampler backfills the outcome onto the row itself.
 DELTA_SAMPLES_QUERY = """
-SELECT window_ts,
+SELECT window_ts, timestamp_ms,
        twap_delta_pct,
        secs_left,
-       actual_resolution
+       actual_resolution, up_bid, up_ask
 FROM delta_samples
 WHERE actual_resolution IS NOT NULL
   AND twap_delta_pct IS NOT NULL
@@ -197,247 +152,234 @@ def pava(values: list, weights: list) -> list:
     return out
 
 
-def build(db_path: str, min_n: int, since_ms: int = 0,
-          source: str = "signals") -> dict:
-    query = SOURCES[source]
-    conn = sqlite3.connect("file:{}?mode=ro".format(db_path), uri=True)
-    try:
-        rows = conn.execute(query, (since_ms,)).fetchall()
-    except sqlite3.OperationalError as exc:
-        conn.close()
-        raise SystemExit(
-            "cannot read '{}' from {}: {}\n"
-            "If the table does not exist yet, the bot has not run with this "
-            "build long enough to create it.".format(source, db_path, exc)
-        )
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    n_secs = len(SECS_EDGES) - 1
-    n_delta = len(DELTA_EDGES) + 1
-
-    counts = [[0] * n_delta for _ in range(n_secs)]
-    wins = [[0] * n_delta for _ in range(n_secs)]
-    windows = [[set() for _ in range(n_delta)] for _ in range(n_secs)]
-
-    used = 0
-    skipped_secs = 0
-    for window_ts, delta, secs_left, resolution in rows:
-        si = secs_bucket(int(secs_left))
-        if si is None:
-            skipped_secs += 1
+def read_samples(db_path: str, source: str, since_ms: int) -> tuple[list, dict]:
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        rows = conn.execute(SOURCES[source], (since_ms,)).fetchall()
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(twap_observations)")}
+        arrivals = dict(conn.execute("SELECT window_ts, resolution_event_ms FROM twap_observations")) if "resolution_event_ms" in columns else None
+    samples = []
+    invalid = 0
+    resolutions = {}
+    for window, timestamp, delta, secs, outcome, bid, ask in rows:
+        if (outcome not in ("Up", "Down") or not math.isfinite(float(delta))
+                or secs_bucket(int(secs)) is None
+                or not window * 1000 <= timestamp <= (window + 300) * 1000):
+            invalid += 1
             continue
-        di = delta_bucket(float(delta))
-        counts[si][di] += 1
-        windows[si][di].add(window_ts)
-        if resolution == REFERENCE_SIDE:
-            wins[si][di] += 1
-        used += 1
+        if window in resolutions and resolutions[window] != outcome:
+            raise ValueError("conflicting resolution labels in window {}".format(window))
+        resolutions[window] = outcome
+        midpoint = None
+        if (bid is not None and ask is not None
+                and math.isfinite(bid) and math.isfinite(ask)
+                and 0 < bid < ask < 1):
+            midpoint = (bid + ask) / 2
+        samples.append((window, timestamp, float(delta), int(secs), outcome, midpoint))
+    samples.sort(key=lambda row: (row[0], row[1]))
+    return samples, {"rows_total": len(rows), "rows_invalid": invalid, "label_arrivals": arrivals}
 
-    # Laplace smoothing, then isotonic regression along the delta axis.
+
+def split_windows(samples: list, holdout_fraction: float, embargo_windows: int, label_arrivals=None):
+    if not 0 < holdout_fraction < 0.5:
+        raise ValueError("holdout_fraction must lie strictly between 0 and 0.5")
+    if embargo_windows < 1:
+        raise ValueError("embargo_windows must be at least one")
+    windows = sorted({r[0] for r in samples})
+    test_n = max(1, math.ceil(len(windows) * holdout_fraction))
+    cut = len(windows) - test_n
+    if cut <= embargo_windows:
+        raise ValueError("not enough resolved windows for training, embargo and holdout")
+    train_windows = set(windows[:cut - embargo_windows])
+    test_windows = set(windows[cut:])
+    train = [r for r in samples if r[0] in train_windows]
+    test = [r for r in samples if r[0] in test_windows]
+    # Windows are 300 seconds long. Never train on an outcome whose window
+    # overlaps the first held-out observation, even with malformed schedules.
+    first_test_ms = min(r[1] for r in test)
+    train = [r for r in train if (r[0] + 300) * 1000 < first_test_ms]
+    if label_arrivals is not None:
+        boundary = min(test_windows) * 1000
+        train = [r for r in train if label_arrivals.get(r[0]) is not None and label_arrivals[r[0]] < boundary]
+    if not train:
+        raise ValueError("no training windows remain after temporal purge")
+    return train, test
+
+
+def fit_samples(samples: list, min_n: int, min_windows: int) -> dict:
+    if min_n < 1 or min_windows < 1:
+        raise ValueError("minimum counts must be positive")
+    n_secs, n_delta = len(SECS_EDGES) - 1, len(DELTA_EDGES) + 1
+    counts = [[0] * n_delta for _ in range(n_secs)]
+    row_wins = [[0] * n_delta for _ in range(n_secs)]
+    windows = [[{} for _ in range(n_delta)] for _ in range(n_secs)]
+    for window, _timestamp, delta, secs, outcome, _mid in samples:
+        si, di = secs_bucket(secs), delta_bucket(delta)
+        counts[si][di] += 1
+        row_wins[si][di] += outcome == "Up"
+        windows[si][di][window] = outcome == "Up"
     grid = []
     for si in range(n_secs):
-        raw = [
-            (wins[si][di] + 1) / (counts[si][di] + 2)
-            for di in range(n_delta)
-        ]
-        weights = [float(counts[si][di] + 2) for di in range(n_delta)]
-        fitted = pava(raw, weights)
-        row = []
-        for di in range(n_delta):
-            n = counts[si][di]
-            row.append({
-                "n": n,
-                "w": len(windows[si][di]),
-                "k": wins[si][di],
-                "p_raw": round(wins[si][di] / n, 6) if n else None,
-                "p_smoothed": round(raw[di], 6),
-                "p": round(min(0.99, max(0.01, fitted[di])), 6),
-                "low_conf": n < min_n,
-            })
-        grid.append(row)
-
+        ws = [len(c) for c in windows[si]]
+        ks = [sum(c.values()) for c in windows[si]]
+        raw = [(k + 1) / (w + 2) for k, w in zip(ks, ws)]
+        fitted = pava(raw, [w + 2 for w in ws])
+        grid.append([{
+            "n": counts[si][di], "w": ws[di], "k": row_wins[si][di],
+            "kw": ks[di], "p_raw": ks[di] / ws[di] if ws[di] else None,
+            "p_smoothed": raw[di], "p": min(0.99, max(0.01, fitted[di])),
+            "low_conf": counts[si][di] < min_n or ws[di] < min_windows,
+        } for di in range(n_delta)])
     return {
-        "version": 1,
-        "generated_at_ms": int(time.time() * 1000),
-        "source_db": db_path,
-        "source_table": source,
-        "since_ms": since_ms,
-        "reference_side": REFERENCE_SIDE,
-        "delta_edges": DELTA_EDGES,
-        "delta_centers": [round(c, 6) for c in delta_centers()],
-        "secs_edges": SECS_EDGES,
-        "min_n": min_n,
-        "rows_total": len(rows),
-        "rows_used": used,
-        "rows_skipped_secs_out_of_range": skipped_secs,
-        "grid": grid,
+        "version": 2, "reference_side": "Up", "delta_edges": DELTA_EDGES,
+        "delta_centers": delta_centers(), "secs_edges": SECS_EDGES,
+        "min_n": min_n, "min_windows": min_windows,
+        "weighting": "one_vote_per_window_per_cell", "grid": grid,
     }
 
 
-def delta_label(di: int) -> str:
-    if di == 0:
-        return "(-inf,{:+.2f})".format(DELTA_EDGES[0])
-    if di == len(DELTA_EDGES):
-        return "[{:+.2f},+inf)".format(DELTA_EDGES[-1])
-    return "[{:+.2f},{:+.2f})".format(DELTA_EDGES[di - 1], DELTA_EDGES[di])
+def predict(model: dict, delta: float, secs: int):
+    """Match Rust's confidence-gated interpolation, including thin neighbours."""
+    if not math.isfinite(delta):
+        return None
+    si = next((i for i, (a, b) in enumerate(zip(
+        model["secs_edges"], model["secs_edges"][1:])) if a <= secs < b), None)
+    if si is None:
+        return None
+    di = sum(delta >= edge for edge in model["delta_edges"])
+    row, centers = model["grid"][si], model["delta_centers"]
+    def usable(c):
+        return (not c["low_conf"] and c["n"] >= model["min_n"]
+                and c["w"] >= model["min_windows"])
+    if not usable(row[di]):
+        return None
+    if abs(delta - centers[di]) < 1e-12:
+        return row[di]["p"]
+    lo, hi = (di, di + 1) if delta >= centers[di] else (di - 1, di)
+    if lo < 0 or hi >= len(centers):
+        return row[di]["p"]
+    if not usable(row[lo]) or not usable(row[hi]):
+        return None
+    t = max(0.0, min(1.0, (delta - centers[lo]) / (centers[hi] - centers[lo])))
+    return row[lo]["p"] + t * (row[hi]["p"] - row[lo]["p"])
 
 
-def secs_label(si: int) -> str:
-    return "{}-{}s".format(SECS_EDGES[si], SECS_EDGES[si + 1])
+def probability_scores(observations: list) -> dict:
+    """Equal weight per window; rows within a window share one vote."""
+    by_window = defaultdict(list)
+    for window, p, y in observations:
+        p = min(1 - 1e-12, max(1e-12, p))
+        by_window[window].append(((p - y) ** 2, -y * math.log(p) - (1-y) * math.log(1-p)))
+    if not by_window:
+        return {"rows": 0, "windows": 0, "brier": None, "log_loss": None}
+    losses = [(sum(a for a, _ in v) / len(v), sum(b for _, b in v) / len(v))
+              for v in by_window.values()]
+    return {"rows": len(observations), "windows": len(by_window),
+            "brier": sum(a for a, _ in losses) / len(losses),
+            "log_loss": sum(b for _, b in losses) / len(losses)}
+
+
+def validate_holdout(model: dict, train: list, test: list) -> dict:
+    train_outcomes = {r[0]: r[4] == "Up" for r in train}
+    baseline = (sum(train_outcomes.values()) + 1) / (len(train_outcomes) + 2)
+    fitted, constant, midpoint, common_model = [], [], [], []
+    for window, _timestamp, delta, secs, outcome, mid in test:
+        p = predict(model, delta, secs)
+        if p is None:
+            continue
+        y = float(outcome == "Up")
+        fitted.append((window, p, y))
+        constant.append((window, baseline, y))
+        if mid is not None:
+            midpoint.append((window, mid, y))
+            common_model.append((window, p, y))
+    return {
+        "method": "chronological_whole_window_holdout_with_embargo",
+        "training_windows": len(train_outcomes), "training_rows": len(train),
+        "training_first_window": min(train_outcomes),
+        "training_last_window": max(train_outcomes),
+        "holdout_windows": len({r[0] for r in test}), "holdout_rows": len(test),
+        "holdout_first_window": min(r[0] for r in test),
+        "holdout_last_window": max(r[0] for r in test),
+        "prediction_coverage_rows": len(fitted) / len(test),
+        "model": probability_scores(fitted),
+        "training_base_rate_on_model_coverage": probability_scores(constant),
+        "model_on_market_coverage": probability_scores(common_model),
+        "market_midpoint_on_same_coverage": probability_scores(midpoint),
+        "profitability_demonstrated": False,
+        "limitations": [
+            "Probability scores are not execution P&L or a live-trading approval.",
+            "Snapshots lack passive queue position, trade flow, quantities and latency.",
+            "One short holdout does not establish robustness across market regimes.",
+            "Outcome label availability times are absent; the embargo reduces but cannot prove elimination of label delay.",
+            "Window weighting avoids duplicate outcomes; adjacent windows may still be dependent.",
+        ],
+    }
+
+
+def build(db_path: str, min_n: int = MIN_N, since_ms: int = 0,
+          source: str = "delta_samples", min_windows: int = MIN_N,
+          holdout_fraction: float = 0.25, embargo_windows: int = 1) -> dict:
+    samples, diagnostics = read_samples(db_path, source, since_ms)
+    arrivals = diagnostics.pop("label_arrivals")
+    train, test = split_windows(samples, holdout_fraction, embargo_windows, arrivals)
+    model = fit_samples(train, min_n, min_windows)
+    model.update({
+        "generated_at_ms": int(time.time() * 1000), "source_db": db_path,
+        "source_table": source, "since_ms": since_ms,
+        "feature": "twap_delta_pct" if source == "delta_samples" else "decision_delta",
+        "rows_used": len(train), "holdout_fraction": holdout_fraction,
+        "embargo_windows": embargo_windows, **diagnostics,
+        "validation": validate_holdout(model, train, test),
+    })
+    model["validation"]["label_availability_checked"] = arrivals is not None
+    if arrivals is not None:
+        model["validation"]["limitations"] = [s for s in model["validation"]["limitations"] if not s.startswith("Outcome label availability")]
+    if source == "signals":
+        model["validation"]["limitations"].append(
+            "signals are filtered by strategy gates; estimates do not cover unconditional market making.")
+    return model
 
 
 def report(model: dict) -> None:
-    grid = model["grid"]
-    n_delta = len(model["delta_centers"])
-    min_n = model["min_n"]
-
-    if model.get("since_ms"):
-        print("since             : {} ({})".format(
-            datetime.datetime.fromtimestamp(
-                model["since_ms"] / 1000, datetime.timezone.utc
-            ).strftime("%Y-%m-%d %H:%M UTC"),
-            model["since_ms"],
-        ))
-    print("source table      : {}".format(model.get("source_table", "signals")))
-    print("rows joined       : {}".format(model["rows_total"]))
-    print("rows used         : {}".format(model["rows_used"]))
-    print("skipped (secs oob): {}".format(
-        model["rows_skipped_secs_out_of_range"]))
-    print("reference side    : {}  (p = P(Up resolves))".format(
-        model["reference_side"]))
-    print("low-confidence    : n < {}".format(min_n))
-    print()
-
-    for si, row in enumerate(grid):
-        total_n = sum(c["n"] for c in row)
-        print("=== secs_left {}   (n={}) ===".format(secs_label(si), total_n))
-        print("{:>20} {:>6} {:>6} {:>8} {:>8} {:>8}  flag".format(
-            "delta bucket", "n", "wins", "p_raw", "p_smth", "p_fit"))
-        for di in range(n_delta):
-            c = row[di]
-            raw = "{:.4f}".format(c["p_raw"]) if c["p_raw"] is not None else "-"
-            flag = "LOW" if c["low_conf"] else ""
-            print("{:>20} {:>6} {:>6} {:>8} {:>8.4f} {:>8.4f}  {}".format(
-                delta_label(di), c["n"], c["k"], raw,
-                c["p_smoothed"], c["p"], flag))
-        print()
-
-    print("=== EXTREME CELLS (p_fit > 0.95 or < 0.05) ===")
-    print("{:>10} {:>20} {:>6} {:>6} {:>8}  flag".format(
-        "secs", "delta bucket", "n", "wins", "p_fit"))
-    found = False
-    for si, row in enumerate(grid):
-        for di, c in enumerate(row):
-            if c["p"] > 0.95 or c["p"] < 0.05:
-                found = True
-                flag = "LOW" if c["low_conf"] else ""
-                print("{:>10} {:>20} {:>6} {:>6} {:>8.4f}  {}".format(
-                    secs_label(si), delta_label(di), c["n"], c["k"],
-                    c["p"], flag))
-    if not found:
-        print("  none")
-    print()
-
-    # ---- COVERAGE: the deliverable ----
-    #
-    # A curve that can only price near-certainties is useless for making a
-    # market. These two numbers say whether this fit can do better than that.
-    min_n = model["min_n"]
-    populated = 0
-    total = 0
-    for row in grid:
-        for c in row:
-            total += 1
-            if c["n"] >= min_n:
-                populated += 1
-
-    # The uncertain middle band: delta buckets whose whole range lies inside
-    # (-0.05, +0.05). Those are the ones the signals-based fit had none of.
-    mid_idx = [
-        di for di in range(len(model["delta_centers"]))
-        if abs(model["delta_centers"][di]) < 0.05
-    ]
-
-    print("=== COVERAGE ===")
-    print("cells with n >= {}: {} of {}".format(min_n, populated, total))
-    print()
-    print("uncertain band (delta buckets inside +/-0.05):")
-    print("{:>10} {:>20} {:>7} {:>7} {:>9}  flag".format(
-        "secs", "delta bucket", "n", "windows", "p_fit"))
-    mid_populated = 0
-    mid_total = 0
-    for si, row in enumerate(grid):
-        for di in mid_idx:
-            c = row[di]
-            mid_total += 1
-            if c["n"] >= min_n:
-                mid_populated += 1
-            flag = "LOW" if c["low_conf"] else ""
-            print("{:>10} {:>20} {:>7} {:>7} {:>9.4f}  {}".format(
-                secs_label(si), delta_label(di), c["n"], c["w"], c["p"], flag))
-    print()
-    print("uncertain-band cells with n >= {}: {} of {}".format(
-        min_n, mid_populated, mid_total))
-    if mid_populated == 0:
-        print()
-        print("*** THE UNCERTAIN BAND IS STILL EMPTY. ***")
-        print("Something is still filtering the samples. Do NOT deploy this")
-        print("curve: it can only price near-certainties, which is the wrong")
-        print("half of the distribution for making a market. Check that the")
-        print("bot is running the unconditional sampler and that")
-        print("delta_samples has rows with |twap_delta_pct| < 0.05 and a")
-        print("non-NULL actual_resolution.")
-    print()
-
-    # Monotonicity assertion -- the fit is worthless if this fails.
-    for si, row in enumerate(grid):
-        ps = [c["p"] for c in row]
-        for a, b in zip(ps, ps[1:]):
-            if b < a - 1e-9:
-                print("MONOTONICITY VIOLATED in {}: {} -> {}".format(
-                    secs_label(si), a, b))
-                sys.exit(1)
-    print("monotonicity: OK (p non-decreasing in delta within every secs bucket)")
+    validation = model["validation"]
+    usable = sum(not c["low_conf"] for row in model["grid"] for c in row)
+    print("Source: {}; training {} windows / {} rows; holdout {} windows / {} rows".format(
+        model["source_table"], validation["training_windows"], model["rows_used"],
+        validation["holdout_windows"], validation["holdout_rows"]))
+    print("Independent-window minimum: {}; usable cells: {}; holdout row coverage: {:.1%}".format(
+        model["min_windows"], usable, validation["prediction_coverage_rows"]))
+    print(json.dumps(validation, indent=2))
+    print("No maker fills or profitability are demonstrated by this report.")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default="trades.db")
     ap.add_argument("--out", default="fairvalue.json")
-    ap.add_argument("--min-n", type=int, default=MIN_N)
-    ap.add_argument(
-        "--source",
-        choices=sorted(SOURCES),
-        default="signals",
-        help="which table to fit from. 'signals' (default) preserves the "
-             "original behaviour but is filtered by the strategy's own gates. "
-             "'delta_samples' is the unconditional sampler and is the correct "
-             "source for a market-making curve.",
-    )
-    ap.add_argument(
-        "--since",
-        default=None,
-        help="only use signals at or after this time (YYYY-MM-DD or epoch ms). "
-             "Use it to fit on the SIGNAL_LOG_CADENCE_MS era only, once enough "
-             "of it exists -- mixing the two sampling regimes over-weights "
-             "reason-transition moments.",
-    )
-    ap.add_argument("--report", action="store_true",
-                    help="print the full grid to stdout")
+    ap.add_argument("--validation-out", help="optional standalone holdout report JSON")
+    ap.add_argument("--min-n", type=int, default=MIN_N, help="minimum raw rows per cell")
+    ap.add_argument("--min-windows", type=int, default=MIN_N,
+                    help="minimum distinct resolved windows per cell")
+    ap.add_argument("--source", choices=sorted(SOURCES), default="delta_samples",
+                    help="delta_samples is unconditional; signals are strategy-filtered")
+    ap.add_argument("--since", help="YYYY-MM-DD or epoch ms")
+    ap.add_argument("--holdout-fraction", type=float, default=0.25)
+    ap.add_argument("--embargo-windows", type=int, default=1)
+    ap.add_argument("--report", action="store_true")
     args = ap.parse_args()
-
-    model = build(args.db, args.min_n, parse_since(args.since), args.source)
-    with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump(model, fh, indent=1)
-    print("wrote {} ({} rows over {}x{} cells)".format(
-        args.out, model["rows_used"], len(model["grid"]),
-        len(model["delta_centers"])))
+    try:
+        model = build(args.db, args.min_n, parse_since(args.since), args.source,
+                      args.min_windows, args.holdout_fraction, args.embargo_windows)
+    except (sqlite3.Error, ValueError) as exc:
+        ap.error(str(exc))
+    for path, data in [(args.out, model), (args.validation_out, model["validation"])]:
+        if path:
+            dest = Path(path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    print("Wrote {} (training prefix only; holdout never refitted)".format(args.out))
     if args.report:
-        print()
         report(model)
     return 0
 

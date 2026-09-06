@@ -1,0 +1,44 @@
+{
+  "method": "chronological_whole_window_holdout_with_embargo",
+  "training_windows": 123,
+  "training_rows": 7257,
+  "training_first_window": 1788585600,
+  "training_last_window": 1788622200,
+  "holdout_windows": 42,
+  "holdout_rows": 2478,
+  "holdout_first_window": 1788622800,
+  "holdout_last_window": 1788635100,
+  "prediction_coverage_rows": 0.47578692493946734,
+  "model": {
+    "rows": 1179,
+    "windows": 42,
+    "brier": 0.22882722465737443,
+    "log_loss": 0.6477652880687917
+  },
+  "training_base_rate_on_model_coverage": {
+    "rows": 1179,
+    "windows": 42,
+    "brier": 0.2523047619047619,
+    "log_loss": 0.6977593787516958
+  },
+  "model_on_market_coverage": {
+    "rows": 390,
+    "windows": 28,
+    "brier": 0.2190591203677415,
+    "log_loss": 0.6260396384384252
+  },
+  "market_midpoint_on_same_coverage": {
+    "rows": 390,
+    "windows": 28,
+    "brier": 0.14391570312715166,
+    "log_loss": 0.44126972672021625
+  },
+  "profitability_demonstrated": false,
+  "limitations": [
+    "Probability scores are not execution P&L or a live-trading approval.",
+    "Snapshots lack passive queue position, trade flow, quantities and latency.",
+    "One short holdout does not establish robustness across market regimes.",
+    "Window weighting avoids duplicate outcomes; adjacent windows may still be dependent."
+  ],
+  "label_availability_checked": true
+}

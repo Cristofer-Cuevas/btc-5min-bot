@@ -43,6 +43,15 @@ pub async fn run_rtds_feed(btc_price: SharedBtcPrice) {
                 error!("RTDS WebSocket error: {}, reconnecting in {}s", e, backoff_secs);
             }
         }
+        {
+            let mut state = btc_price.write().await;
+            state.current_price = None;
+            state.last_update_ms = 0;
+            state.twap_30_value = None;
+            state.twap_30_observed_at_ms = None;
+            state.twap_30_display_value = None;
+            state.twap_30_source = None;
+        }
         tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
@@ -128,7 +137,7 @@ async fn connect_and_listen(btc_price: &SharedBtcPrice) -> Result<(), String> {
             loop {
                 interval.tick().await;
                 let mut w = pw.lock().await;
-                if w.send(Message::Ping(vec![])).await.is_err() {
+                if w.send(Message::Text("PING".into())).await.is_err() {
                     break;
                 }
             }
@@ -241,6 +250,9 @@ async fn handle_rtds_message(
     btc_price: &SharedBtcPrice,
     twap_seen: &mut bool,
 ) -> MsgOutcome {
+    if text == "PONG" {
+        return MsgOutcome::default();
+    }
     let msg: RtdsMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(_) => {
@@ -282,7 +294,13 @@ async fn handle_spot_update(msg: &RtdsMessage, btc_price: &SharedBtcPrice) {
 
     if let Some(value) = payload.value {
         let ts = payload.timestamp.unwrap_or(0);
+        if !value.is_finite() || value <= 0.0 || !valid_observation_time(ts) {
+            return;
+        }
         let mut state = btc_price.write().await;
+        if ts <= state.last_update_ms {
+            return;
+        }
         state.current_price = Some(value);
         state.last_update_ms = ts;
         debug!("BTC/USD: ${:.2} (ts={})", value, ts);
@@ -317,17 +335,24 @@ async fn handle_twap_update(
         return false;
     };
 
-    // Use the Chainlink observation time, not local receive time and not the
-    // outer publisher timestamp. Left as None if the feed omits it: freshness
-    // is judged solely from this value, so an absent timestamp must fail
-    // closed (treated as stale) rather than default to a misleading zero.
-    let observed_ms = payload.timestamp.map(|t| t as i64);
-    if observed_ms.is_none() {
-        warn!("TWAP update missing payload.timestamp; reading cannot be freshness-checked");
+    let Some(observed) = payload.timestamp.filter(|t| valid_observation_time(*t)) else {
+        return false;
+    };
+    let digits = exact.strip_prefix('+').unwrap_or(exact);
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || !digits.bytes().any(|b| b != b'0')
+        || payload.window_s.is_some_and(|window| window != 30)
+    {
+        return false;
     }
+    let observed_ms = Some(observed as i64);
 
     {
         let mut state = btc_price.write().await;
+        if state.twap_30_observed_at_ms.is_some_and(|previous| previous >= observed as i64) {
+            return false;
+        }
         state.twap_30_value = Some(exact.to_string());
         state.twap_30_observed_at_ms = observed_ms;
         state.twap_30_display_value = payload.value;
@@ -353,6 +378,11 @@ async fn handle_twap_update(
     );
 
     true
+}
+
+fn valid_observation_time(timestamp: u64) -> bool {
+    timestamp > 0
+        && timestamp <= (chrono::Utc::now().timestamp_millis() as u64).saturating_add(1_000)
 }
 
 /// RTDS does not document an error envelope, so rather than guess a schema and

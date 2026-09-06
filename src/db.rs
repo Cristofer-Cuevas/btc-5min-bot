@@ -24,7 +24,7 @@ const TRADE_SELECT_COLS: &str = "\
     twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike, \
     twap_source_at_entry, \
     binance_twap_delta_at_entry, binance_twap_strike_at_entry, \
-    delta_momentum_at_entry";
+    delta_momentum_at_entry, fee_estimate_usdc";
 
 /// True if `table` already has a column named `column`, per pragma table_info.
 /// Used to guard additive migrations so re-running init is a no-op instead of
@@ -103,6 +103,7 @@ fn read_trade_row(row: &Row) -> rusqlite::Result<TradeRecord> {
         binance_twap_delta_at_entry: row.get(42)?,
         binance_twap_strike_at_entry: row.get(43)?,
         delta_momentum_at_entry: row.get(44)?,
+        fee_estimate_usdc: row.get(45)?,
     })
 }
 
@@ -139,6 +140,26 @@ impl Database {
                 order_id        TEXT,
                 dry_run         INTEGER DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS order_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                window_ts INTEGER NOT NULL,
+                token_id TEXT NOT NULL,
+                reserved_cost REAL NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('submitted','unknown','rejected','filled')),
+                order_id TEXT,
+                detail TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_order_per_window
+                ON order_attempts(window_ts) WHERE status != 'rejected';
+
+            CREATE TABLE IF NOT EXISTS market_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                received_ms INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS market_event_time ON market_events(received_ms);
 
             CREATE TABLE IF NOT EXISTS daily_stats (
                 date            TEXT PRIMARY KEY,
@@ -368,7 +389,8 @@ impl Database {
         // Binance values are REAL (the feed publishes floats); Chainlink values
         // stay TEXT holding raw E18, so the two representations never share a
         // column.
-        let binance_twap_cols: [(&str, &str, &str); 32] = [
+        let binance_twap_cols: [(&str, &str, &str); 33] = [
+            ("trades", "fee_estimate_usdc", "REAL"),
             ("signals", "binance_twap_delta_pct", "REAL"),
             ("signals", "binance_twap_value", "REAL"),
             ("signals", "binance_twap_strike", "REAL"),
@@ -720,6 +742,70 @@ impl Database {
         }
     }
 
+    /// Atomically check durable risk state and reserve an order before sending
+    /// any network request. A crash leaves `submitted`, blocking further live
+    /// orders until its exchange outcome is reconciled.
+    pub fn reserve_live_order(
+        &self, cfg: &crate::config::RuntimeConfig, window_ts: i64,
+        token_id: &str, cost: f64,
+    ) -> Result<i64, String> {
+        if cfg.dry_run || !cfg.taker_enabled { return Err("live_trading_disabled".into()); }
+        let mut conn = self.conn.lock().map_err(|_| "database lock poisoned")?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().timestamp();
+        let result = (|| -> SqlResult<crate::risk::RiskSnapshot> {
+            let (daily_pnl, open_cost, stale_positions, window_already_traded) = tx.query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN date(COALESCE(resolved_at,timestamp),'unixepoch') = date(?1,'unixepoch') THEN COALESCE(profit,0) ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN resolution IS NULL THEN cost_usdc ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN resolution IS NULL AND window_ts + 900 < ?1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN window_ts = ?2 THEN 1 ELSE 0 END),0) > 0
+                 FROM trades WHERE dry_run = 0",
+                params![now, window_ts], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            )?;
+            let ambiguous_orders = tx.query_row(
+                "SELECT COUNT(*) FROM order_attempts WHERE status IN ('submitted','unknown')", [], |r| r.get(0),
+            )?;
+            let mut stmt = tx.prepare("SELECT won FROM trades WHERE dry_run=0 AND won IS NOT NULL ORDER BY COALESCE(resolved_at,timestamp) DESC, id DESC")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            let mut consecutive_losses = 0;
+            for row in rows {
+                if row? != 0 { break; }
+                consecutive_losses += 1;
+            }
+            Ok(crate::risk::RiskSnapshot { daily_pnl, open_cost, consecutive_losses,
+                ambiguous_orders, stale_positions, window_already_traded })
+        })().map_err(|e| format!("risk_database_error: {e}"))?;
+        result.check(cost, cfg.max_trade_cost_usdc, cfg.max_open_cost_usdc,
+            cfg.daily_loss_limit_usdc, cfg.max_consecutive_losses)?;
+        tx.execute("INSERT INTO order_attempts(timestamp,window_ts,token_id,reserved_cost,status) VALUES(?1,?2,?3,?4,'submitted')",
+            params![now,window_ts,token_id,cost]).map_err(|e| e.to_string())?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    pub fn finish_order_attempt(&self, id: i64, status: &str, order_id: Option<&str>, detail: Option<&str>) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE order_attempts SET status=?1,order_id=?2,detail=?3 WHERE id=?4 AND status='submitted'",
+            params![status,order_id,detail,id],
+        )?;
+        if changed != 1 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+        Ok(())
+    }
+
+    pub fn insert_market_events(&self, events: &[(i64, String)]) -> SqlResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut insert = tx.prepare("INSERT INTO market_events(received_ms,payload) VALUES(?1,?2)")?;
+            for (time, payload) in events { insert.execute(params![time,payload])?; }
+        }
+        tx.commit()
+    }
+
     pub fn insert_trade(&self, trade: &TradeRecord) -> SqlResult<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -738,7 +824,7 @@ impl Database {
                 twap_delta_pct_at_entry, twap_strike_at_entry, used_twap_strike,
                 twap_source_at_entry,
                 binance_twap_delta_at_entry, binance_twap_strike_at_entry,
-                delta_momentum_at_entry
+                delta_momentum_at_entry, fee_estimate_usdc
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5,
                 ?6, ?7, ?8, ?9, ?10, ?11,
@@ -754,7 +840,7 @@ impl Database {
                 ?34, ?35, ?36,
                 ?37,
                 ?38, ?39,
-                ?40
+                ?40, ?41
              )",
             params![
                 trade.timestamp,
@@ -797,6 +883,7 @@ impl Database {
                 trade.binance_twap_delta_at_entry,
                 trade.binance_twap_strike_at_entry,
                 trade.delta_momentum_at_entry,
+                trade.fee_estimate_usdc,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -945,17 +1032,17 @@ impl Database {
     }
 
     pub fn get_stats_today(&self) -> TradingStats {
-        self.get_stats_for_period("date(timestamp, 'unixepoch') = date('now')")
+        self.get_stats_for_period("date(timestamp, 'unixepoch') = date('now') AND dry_run = 0")
     }
 
     pub fn get_stats_week(&self) -> TradingStats {
         self.get_stats_for_period(
-            "date(timestamp, 'unixepoch') >= date('now', '-7 days')",
+            "date(timestamp, 'unixepoch') >= date('now', '-7 days') AND dry_run = 0",
         )
     }
 
     pub fn get_stats_all(&self) -> TradingStats {
-        self.get_stats_for_period("1=1")
+        self.get_stats_for_period("dry_run = 0")
     }
 
     pub fn get_stats_today_live(&self) -> TradingStats {
@@ -1030,16 +1117,22 @@ impl Database {
         &self,
         window_ts: i64,
         resolution: &str,
-        won: bool,
-        payout: f64,
-        profit: f64,
+        _won: bool,
+        _payout: f64,
+        _profit: f64,
     ) -> SqlResult<usize> {
+        if !matches!(resolution, "Up" | "Down") {
+            return Err(rusqlite::Error::InvalidParameterName("invalid resolution".into()));
+        }
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         let updated = conn.execute(
-            "UPDATE trades SET resolution = ?1, won = ?2, payout = ?3, profit = ?4, resolved_at = ?5
-             WHERE window_ts = ?6 AND resolution IS NULL",
-            params![resolution, won as i32, payout, profit, now, window_ts],
+            "UPDATE trades SET resolution = ?1, won = (side = ?1),
+                payout = CASE WHEN side = ?1 THEN shares ELSE 0 END,
+                profit = CASE WHEN side = ?1 THEN shares ELSE 0 END - cost_usdc,
+                resolved_at = ?2
+             WHERE window_ts = ?3 AND resolution IS NULL",
+            params![resolution, now, window_ts],
         )?;
 
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -1890,5 +1983,51 @@ mod delta_sample_tests {
             "expected 60 samples per 300s window at a 5s cadence, got {}",
             written
         );
+    }
+}
+
+#[cfg(test)]
+mod durable_risk_tests {
+    use super::*;
+
+    fn config() -> crate::config::RuntimeConfig {
+        let mut cfg = crate::config::test_config();
+        cfg.dry_run = false;
+        cfg.taker_enabled = true;
+        cfg
+    }
+
+    #[test]
+    fn order_intent_survives_restart_and_blocks_duplicate_spending() {
+        let path = std::env::temp_dir().join(format!("btc-risk-{}.db", rand::random::<u64>()));
+        let cfg = config();
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        let id = db.reserve_live_order(&cfg, 300, "token", 5.0).unwrap();
+        drop(db);
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        assert!(db.reserve_live_order(&cfg, 600, "token2", 5.0).unwrap_err().contains("reconciliation"));
+        db.finish_order_attempt(id, "rejected", None, Some("confirmed rejected by exchange")).unwrap();
+        let next = db.reserve_live_order(&cfg, 300, "token", 5.0).unwrap();
+        db.finish_order_attempt(next, "unknown", Some("exchange-id"), None).unwrap();
+        assert!(db.reserve_live_order(&cfg, 900, "token3", 5.0).is_err());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn settled_rows_use_each_positions_own_side_size_and_fee_inclusive_cost() {
+        let db = Database::new(":memory:").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("INSERT INTO trades(timestamp,window_ts,slug,side,btc_delta_pct,entry_price,shares,cost_usdc,secs_left,dry_run)
+                VALUES(300,300,'s','Up',0.1,0.6,5,3.1,60,0),
+                      (300,300,'s','Down',-0.1,0.3,10,3.2,60,1)").unwrap();
+        }
+        assert_eq!(db.resolve_trade_by_window_ts(300,"Up",true,999.0,999.0).unwrap(),2);
+        let conn = db.conn.lock().unwrap();
+        let up: f64 = conn.query_row("SELECT profit FROM trades WHERE side='Up'", [], |r| r.get(0)).unwrap();
+        let down: f64 = conn.query_row("SELECT profit FROM trades WHERE side='Down'", [], |r| r.get(0)).unwrap();
+        assert!((up - 1.9).abs() < 1e-9);
+        assert!((down + 3.2).abs() < 1e-9);
     }
 }

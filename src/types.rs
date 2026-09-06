@@ -22,9 +22,13 @@ pub struct TokenBook {
     pub last_trade_price: Option<f64>,
     pub ask_depth: Option<f64>,
     pub bid_depth: Option<f64>,
-    /// Full ask ladder from the most recent `book` snapshot, sorted ascending
-    /// by price. Stale between snapshots (not rebuilt on price_change events).
+    /// Ask ladder, maintained from snapshots and incremental changes.
     pub ask_levels: Vec<(f64, f64)>,
+    /// Bid ladder, sorted ascending by price, used to maintain total depth.
+    pub bid_levels: Vec<(f64, f64)>,
+    /// Exchange timestamp of the most recent accepted book update. Zero means
+    /// there is no complete snapshot on the current connection.
+    pub last_update_ms: u64,
 }
 
 impl TokenBook {
@@ -138,7 +142,7 @@ impl BtcPriceState {
     pub fn fresh_twap_30(&self, now_ms: i64, max_age_ms: i64) -> Option<(String, i64)> {
         let v = self.twap_30_value.as_ref()?;
         let obs = self.twap_30_observed_at_ms?;
-        if now_ms.saturating_sub(obs) > max_age_ms {
+        if obs <= 0 || obs > now_ms || now_ms.saturating_sub(obs) > max_age_ms {
             return None;
         }
         Some((v.clone(), obs))
@@ -803,6 +807,9 @@ pub struct TradeRecord {
     pub binance_twap_strike_at_entry: Option<f64>,
     /// Delta-momentum ratio at the moment the order was placed.
     pub delta_momentum_at_entry: Option<f64>,
+    /// Conservative collateral fee estimate, not a reconciled exchange debit.
+    /// NULL for legacy trades whose recorded costs excluded fees.
+    pub fee_estimate_usdc: Option<f64>,
 }
 
 // ── Strategy Evaluation Result ──
@@ -1458,17 +1465,27 @@ pub struct ClobSubscribe {
 pub struct ClobWsMessage {
     pub event_type: Option<String>,
     pub asset_id: Option<String>,
+    pub timestamp: Option<String>,
     // book event
     pub bids: Option<Vec<ClobBookLevel>>,
     pub asks: Option<Vec<ClobBookLevel>>,
     // price_change event
-    pub best_bid: Option<String>,
-    pub best_ask: Option<String>,
+    pub price_changes: Option<Vec<ClobPriceChange>>,
     // last_trade_price event
     pub price: Option<String>,
     // market_resolved
     pub winning_outcome: Option<String>,
     pub winning_asset_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClobPriceChange {
+    pub asset_id: String,
+    pub price: String,
+    pub size: String,
+    pub side: String,
+    pub best_bid: Option<String>,
+    pub best_ask: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1507,6 +1524,8 @@ pub struct FillResult {
     pub order_id: String,
     pub fill_price: f64,
     pub filled_size: f64,
+    /// Conservative V2 collateral-fee estimate; reconcile with on-chain fees.
+    pub fee_estimate_usdc: f64,
 }
 
 // ── Stats ──

@@ -160,7 +160,7 @@ async fn handle_update(
         }
         "/set_shares" => {
             if let Some(val) = parts.get(1).and_then(|v| v.parse::<f64>().ok()) {
-                if val < 5.0 {
+                if !val.is_finite() || val < 5.0 {
                     "Minimum 5 shares".into()
                 } else {
                     set_param(config, db, "bet_shares", val).await
@@ -203,15 +203,16 @@ async fn handle_update(
             }
         }
         "/dryrun" => {
-            if let Some(mode) = parts.get(1) {
-                let on = *mode == "on";
-                let mut cfg = config.write().await;
-                let old = cfg.dry_run;
-                cfg.dry_run = on;
-                db.log_config_change("dry_run", &old.to_string(), &on.to_string());
-                format!("Dry run: {} → {}", old, on)
-            } else {
-                "Usage: /dryrun on|off".into()
+            match parts.get(1).copied() {
+                Some("on") => {
+                    let mut cfg = config.write().await;
+                    let old = cfg.dry_run;
+                    cfg.dry_run = true;
+                    db.log_config_change("dry_run", &old.to_string(), "true");
+                    "Dry run enabled.".into()
+                }
+                Some("off") => "Live mode requires a restart with DRY_RUN=false and TAKER_ENABLED=true. Research results do not establish profitability.".into(),
+                _ => "Usage: /dryrun on|off".into(),
             }
         }
         "/pause" => {
@@ -224,7 +225,7 @@ async fn handle_update(
             ws.paused = false;
             drop(ws);
             db.mark_kill_switch_resumed();
-            "Trading resumed.".into()
+            "Monitoring resumed. Durable exposure, unresolved-order and loss limits still apply to live entries.".into()
         }
         "/limits" => build_limits_display(config).await,
         "/last" => {
@@ -291,6 +292,7 @@ async fn build_status(
          TWAP coverage: {}\n\
          TWAP strike: {}\n\
          Dry run: {}\n\
+         Taker enabled: {}\n\
          Paused: {}\n\
          Uptime: {}h {}m",
         ws.window_ts,
@@ -304,6 +306,7 @@ async fn build_status(
             .and_then(crate::types::format_e18)
             .unwrap_or_else(|| "N/A".into()),
         cfg.dry_run,
+        cfg.taker_enabled,
         ws.paused,
         hours,
         mins,
@@ -316,7 +319,7 @@ async fn build_stats(db: &Arc<Database>) -> String {
     let all = db.get_stats_all();
 
     format!(
-        "<b>Trading Stats</b>\n\n\
+        "<b>Live Trading Stats</b> (paper excluded; legacy fees unreconciled)\n\n\
          <b>Today:</b>\n\
          Trades: {} | W: {} L: {} | WR: {:.0}%\n\
          Cost: ${:.2} | Payout: ${:.2} | P&amp;L: ${:.2}\n\n\
@@ -508,50 +511,17 @@ async fn build_testorder(
         );
     }
 
-    let sdk = match sdk_client.as_ref() {
-        Some(c) => c,
-        None => return "SDK client not available (dry-run mode or no credentials)".into(),
-    };
-
-    match trading::place_fak_buy_raw(
-        sdk, &cfg, wallet, &signal, price, shares, "0.01", false,
-    )
-    .await
-    {
-        Ok(fill) if fill.fill_price == 0.0 || fill.filled_size == 0.0 => {
-            info!(
-                "TEST ORDER: token={} price={} shares={} result=unmatched order_id={}",
-                token_id, price, shares, fill.order_id
-            );
-            format!("⚠️ TEST ORDER UNMATCHED: order_id={}", fill.order_id)
-        }
-        Ok(fill) => {
-            info!(
-                "TEST ORDER: token={} price={} shares={} result=filled order_id={}",
-                token_id, price, shares, fill.order_id
-            );
-            format!(
-                "✅ TEST ORDER: order_id={} fill_price=${:.4} filled={:.2} shares",
-                fill.order_id, fill.fill_price, fill.filled_size
-            )
-        }
-        Err(e) => {
-            info!(
-                "TEST ORDER: token={} price={} shares={} result=error msg={}",
-                token_id, price, shares, e
-            );
-            format!("❌ TEST ORDER FAILED: {}", e)
-        }
-    }
+    // The historical command bypassed the trade ledger and all portfolio risk
+    // limits. Keep it diagnostic until it can share the journaled entry path.
+    let _ = (wallet, sdk_client);
+    "Live test orders disabled: this command does not journal positions. Use the risk-checked strategy path.".into()
 }
 
 /// Send daily summary at midnight UTC.
 /// PHASE 2 shadow-quoting report. Reads `maker_shadow` only; sends no orders.
 ///
-/// The headline number is the bid-fill hit rate. If simulated bid fills land on
-/// the losing side materially more often than fair value implies, we are being
-/// adversely selected and market making does not work at this latency — that is
-/// the Phase 3 gate.
+/// Legacy crossings are marketable quotes, not passive executions.
+/// This report cannot establish maker fill rates or profitable inventory exits.
 async fn build_maker_report(config: &SharedConfig, db: &Arc<Database>, n: i64) -> String {
     let (mode, half_spread, fv_path) = {
         let cfg = config.read().await;
@@ -626,11 +596,11 @@ async fn build_maker_report(config: &SharedConfig, db: &Arc<Database>, n: i64) -
         "<b>Maker shadow</b> (mode={}, half-spread={:.3})\n\
          NO ORDERS SENT — measurement only.\n\n\
          Resolved rows: {} (span {}), pending {}\n\n\
-         <b>Simulated BID fills</b> (we would have BOUGHT)\n\
-         fills: {} of {} rows ({})\n\
+         <b>Legacy BID crossings</b> (not passive fills)\n\
+         crossings: {} of {} rows ({})\n\
          on winning side: {} ({})\n\n\
-         <b>Simulated ASK fills</b> (we would have SOLD)\n\
-         fills: {} of {} rows ({})\n\
+         <b>Legacy ASK crossings</b> (not passive fills)\n\
+         crossings: {} of {} rows ({})\n\
          side went on to win: {} ({}) — high is bad, we sold the winner\n\n\
          <b>Model vs market</b>\n\
          mean |fair_value - mid|: {}\n\

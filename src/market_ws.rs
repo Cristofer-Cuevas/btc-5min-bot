@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-use crate::types::{ClobBookLevel, ClobSubscribe, ClobWsMessage, SharedMarketState};
+use crate::types::{ClobBookLevel, ClobPriceChange, ClobSubscribe, ClobWsMessage, SharedMarketState, TokenBook};
 
 const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
@@ -27,8 +27,10 @@ pub async fn run_clob_ws(
     market_state: SharedMarketState,
     mut cmd_rx: mpsc::Receiver<ClobCommand>,
     resolution_tx: mpsc::Sender<ResolutionEvent>,
+    tape: Option<crate::recorder::TapeSender>,
 ) {
     let mut backoff_secs = 3u64;
+    let mut dropped_events = 0usize;
     let shared_tokens: std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
@@ -38,13 +40,13 @@ pub async fn run_clob_ws(
         match connect_async(CLOB_WS_URL).await {
             Ok((ws_stream, _)) => {
                 info!("CLOB WebSocket connected");
+                crate::recorder::record(&tape, &mut dropped_events, r#"{"event_type":"capture_connected"}"#);
                 backoff_secs = 3;
 
                 let (write, mut read) = ws_stream.split();
                 let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
 
-                // Spawn keepalive task — WS-level ping every 10s
-                // TODO: if Polymarket still drops us, try sending {"type":"PING"} text instead
+                // The CLOB requires application-level text PING, not a WS ping.
                 let ping_handle = {
                     let pw = write.clone();
                     tokio::spawn(async move {
@@ -52,7 +54,7 @@ pub async fn run_clob_ws(
                         loop {
                             interval.tick().await;
                             let mut w = pw.lock().await;
-                            if w.send(Message::Ping(vec![])).await.is_err() {
+                            if w.send(Message::Text("PING".into())).await.is_err() {
                                 break;
                             }
                             debug!("CLOB WS ping sent");
@@ -62,6 +64,7 @@ pub async fn run_clob_ws(
 
                 // Re-subscribe to current tokens if we had any
                 let current_tokens = shared_tokens.lock().await.clone();
+                let mut subscribed = current_tokens.is_some();
                 if let Some((ref up, ref down)) = current_tokens {
                     let sub = ClobSubscribe {
                         assets_ids: vec![up.clone(), down.clone()],
@@ -89,9 +92,12 @@ pub async fn run_clob_ws(
                 loop {
                     tokio::select! {
                         // Handle incoming WebSocket messages
-                        ws_msg = read.next() => {
+                        ws_msg = tokio::time::timeout(std::time::Duration::from_secs(30), read.next()) => {
                             match ws_msg {
-                                Some(Ok(Message::Text(text))) => {
+                                Ok(Some(Ok(Message::Text(text)))) => {
+                                    if text != "PONG" {
+                                        crate::recorder::record(&tape, &mut dropped_events, &text);
+                                    }
                                     let tokens = shared_tokens.lock().await.clone();
                                     handle_clob_message(
                                         &text,
@@ -101,19 +107,23 @@ pub async fn run_clob_ws(
                                     )
                                     .await;
                                 }
-                                Some(Ok(Message::Ping(data))) => {
+                                Ok(Some(Ok(Message::Ping(data)))) => {
                                     let mut w = write.lock().await;
                                     let _ = w.send(Message::Pong(data)).await;
                                 }
-                                Some(Ok(Message::Close(_))) => {
+                                Ok(Some(Ok(Message::Close(_)))) => {
                                     warn!("CLOB WebSocket closed");
                                     break;
                                 }
-                                Some(Err(e)) => {
+                                Ok(Some(Err(e))) => {
                                     error!("CLOB WebSocket read error: {}", e);
                                     break;
                                 }
-                                None => break,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    warn!("CLOB heartbeat timed out; clearing books and reconnecting");
+                                    break;
+                                }
                                 _ => {}
                             }
                         }
@@ -121,20 +131,28 @@ pub async fn run_clob_ws(
                         cmd = cmd_rx.recv() => {
                             match cmd {
                                 Some(ClobCommand::Subscribe { up_token_id, down_token_id }) => {
-                                    let sub = ClobSubscribe {
-                                        assets_ids: vec![up_token_id.clone(), down_token_id.clone()],
-                                        sub_type: "market".into(),
-                                        custom_feature_enabled: true,
+                                    let sub = if subscribed {
+                                        serde_json::json!({
+                                            "assets_ids": [up_token_id.clone(), down_token_id.clone()],
+                                            "operation": "subscribe", "custom_feature_enabled": true
+                                        })
+                                    } else {
+                                        serde_json::json!({
+                                            "assets_ids": [up_token_id.clone(), down_token_id.clone()],
+                                            "type": "market", "custom_feature_enabled": true
+                                        })
                                     };
+                                    *shared_tokens.lock().await = Some((up_token_id, down_token_id));
                                     if let Ok(msg) = serde_json::to_string(&sub) {
                                         let mut w = write.lock().await;
                                         if let Err(e) = w.send(Message::Text(msg)).await {
                                             error!("Failed to send CLOB subscribe: {}", e);
+                                            break;
                                         } else {
                                             info!("Subscribed to CLOB tokens");
+                                            subscribed = true;
                                         }
                                     }
-                                    *shared_tokens.lock().await = Some((up_token_id, down_token_id));
                                     // Reset trade counts on subscribe to avoid phantom trades.
                                     //
                                     // The books are cleared here too. Between window rotation
@@ -171,9 +189,12 @@ pub async fn run_clob_ws(
                 }
 
                 ping_handle.abort();
+                crate::recorder::record(&tape, &mut dropped_events, r#"{"event_type":"capture_disconnected"}"#);
+                clear_books(&market_state).await;
                 warn!("CLOB WebSocket disconnected, will reconnect");
             }
             Err(e) => {
+                clear_books(&market_state).await;
                 error!("CLOB WebSocket connection failed: {}", e);
             }
         }
@@ -183,12 +204,21 @@ pub async fn run_clob_ws(
     }
 }
 
+async fn clear_books(market_state: &SharedMarketState) {
+    let mut state = market_state.write().await;
+    state.up_book = TokenBook::default();
+    state.down_book = TokenBook::default();
+}
+
 async fn handle_clob_message(
     text: &str,
     market_state: &SharedMarketState,
     resolution_tx: &mpsc::Sender<ResolutionEvent>,
     current_tokens: &Option<(String, String)>,
 ) {
+    if text == "PONG" {
+        return;
+    }
     // CLOB sends arrays of events
     let messages: Vec<ClobWsMessage> = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -211,6 +241,19 @@ async fn handle_clob_message(
 
     for msg in messages {
         let event_type = msg.event_type.as_deref().unwrap_or("");
+        // Since September 2025 price_change identifies assets inside the
+        // price_changes array. Filtering by the outer asset_id drops every
+        // incremental update and leaves cancelled liquidity in the ladder.
+        if event_type == "price_change" {
+            let Some(timestamp) = event_timestamp(msg.timestamp.as_deref()) else { continue };
+            let Some(changes) = msg.price_changes.as_ref() else { continue };
+            let mut state = market_state.write().await;
+            let up_changes: Vec<_> = changes.iter().filter(|c| c.asset_id == *up_token).collect();
+            let down_changes: Vec<_> = changes.iter().filter(|c| c.asset_id == *down_token).collect();
+            apply_changes(&mut state.up_book, &up_changes, timestamp);
+            apply_changes(&mut state.down_book, &down_changes, timestamp);
+            continue;
+        }
         let asset_id = msg.asset_id.as_deref().unwrap_or("");
         let is_up = asset_id == up_token;
         let is_down = asset_id == down_token;
@@ -221,58 +264,25 @@ async fn handle_clob_message(
 
         match event_type {
             "book" => {
+                let Some(timestamp) = event_timestamp(msg.timestamp.as_deref()) else { continue };
                 let mut state = market_state.write().await;
                 let book = if is_up {
                     &mut state.up_book
                 } else {
                     &mut state.down_book
                 };
-                book.best_bid = best_price(&msg.bids, true);
-                book.best_ask = best_price(&msg.asks, false);
-
-                // ADD: compute total depth
-                book.ask_depth = msg.asks.as_ref().map(|levels| {
-                    levels.iter()
-                        .filter_map(|l| l.size.parse::<f64>().ok())
-                        .sum()
-                });
-                book.bid_depth = msg.bids.as_ref().map(|levels| {
-                    levels.iter()
-                        .filter_map(|l| l.size.parse::<f64>().ok())
-                        .sum()
-                });
-
-                // Full ask ladder sorted ascending by price, for fillable-depth
-                // queries (ask_depth_up_to). Cleared and rebuilt on every book
-                // snapshot; not maintained between snapshots.
-                book.ask_levels = msg.asks.as_ref().map(|levels| {
-                    let mut v: Vec<(f64, f64)> = levels.iter()
-                        .filter_map(|l| {
-                            let p = l.price.parse::<f64>().ok()?;
-                            let s = l.size.parse::<f64>().ok()?;
-                            Some((p, s))
-                        })
-                        .collect();
-                    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                    v
-                }).unwrap_or_default();
-            }
-            "price_change" => {
-                let mut state = market_state.write().await;
-                let book = if is_up {
-                    &mut state.up_book
-                } else {
-                    &mut state.down_book
+                if timestamp < book.last_update_ms {
+                    continue;
+                }
+                let (Some(asks), Some(bids)) =
+                    (parse_levels(msg.asks.as_deref()), parse_levels(msg.bids.as_deref()))
+                else {
+                    *book = TokenBook::default();
+                    continue;
                 };
-                // NOTE: best_bid/best_ask are refreshed here, but ask_levels
-                // (and ask_depth) are NOT — they only update on full `book`
-                // snapshots, so the ladder may lag best_ask between snapshots.
-                if let Some(ref bid) = msg.best_bid {
-                    book.best_bid = bid.parse().ok();
-                }
-                if let Some(ref ask) = msg.best_ask {
-                    book.best_ask = ask.parse().ok();
-                }
+                book.ask_levels = asks;
+                book.bid_levels = bids;
+                refresh_book(book, timestamp);
             }
             "last_trade_price" => {
                 if let Some(ref price) = msg.price {
@@ -284,7 +294,7 @@ async fn handle_clob_message(
                         state.down_trade_count += 1;  // ← ADD
                         &mut state.down_book
                     };
-                    book.last_trade_price = price.parse().ok();
+                    book.last_trade_price = valid_price(price);
                 }
             }
             "market_resolved" => {
@@ -337,13 +347,92 @@ async fn handle_clob_message(
     }
 }
 
-fn best_price(levels: &Option<Vec<ClobBookLevel>>, is_bid: bool) -> Option<f64> {
-    levels.as_ref().and_then(|levels| {
-        levels
-            .iter()
-            .filter_map(|l| l.price.parse::<f64>().ok())
-            .reduce(if is_bid { f64::max } else { f64::min })
-    })
+fn event_timestamp(raw: Option<&str>) -> Option<u64> {
+    let timestamp: u64 = raw?.parse().ok()?;
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    (timestamp > 0 && timestamp <= now.saturating_add(1_000)).then_some(timestamp)
+}
+
+fn valid_price(raw: &str) -> Option<f64> {
+    let value: f64 = raw.parse().ok()?;
+    (value.is_finite() && value > 0.0 && value < 1.0).then_some(value)
+}
+
+fn parse_levels(raw: Option<&[ClobBookLevel]>) -> Option<Vec<(f64, f64)>> {
+    let mut levels = Vec::new();
+    for level in raw? {
+        let price = valid_price(&level.price)?;
+        let size: f64 = level.size.parse().ok()?;
+        if !size.is_finite() || size < 0.0 {
+            return None;
+        }
+        if size > 0.0 {
+            update_level(&mut levels, price, size);
+        }
+    }
+    Some(levels)
+}
+
+fn update_level(levels: &mut Vec<(f64, f64)>, price: f64, size: f64) {
+    levels.retain(|(p, _)| (*p - price).abs() > 1e-9);
+    if size > 0.0 {
+        levels.push((price, size));
+        levels.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+}
+
+fn refresh_book(book: &mut TokenBook, timestamp: u64) {
+    book.best_ask = book.ask_levels.first().map(|level| level.0);
+    book.best_bid = book.bid_levels.last().map(|level| level.0);
+    book.ask_depth = Some(book.ask_levels.iter().map(|level| level.1).sum());
+    book.bid_depth = Some(book.bid_levels.iter().map(|level| level.1).sum());
+    book.last_update_ms = timestamp;
+    if book.spread().is_some_and(|spread| spread < 0.0) {
+        // A crossed local book indicates a lost or inconsistent update.
+        // Wait for a full snapshot before exposing any liquidity again.
+        *book = TokenBook::default();
+    }
+}
+
+fn apply_changes(book: &mut TokenBook, changes: &[&ClobPriceChange], timestamp: u64) {
+    // A delta cannot reconstruct a complete book after reconnecting.
+    if changes.is_empty() || book.last_update_ms == 0 || timestamp < book.last_update_ms {
+        return;
+    }
+    // A frame may change several levels of one token. Apply it atomically:
+    // intermediate ladders can disagree with the final BBO in that frame.
+    for change in changes {
+        let price = valid_price(&change.price);
+        let size = change.size.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+        let (Some(price), Some(size)) = (price, size) else {
+            *book = TokenBook::default();
+            return;
+        };
+        let levels = match change.side.as_str() {
+            "SELL" => &mut book.ask_levels,
+            "BUY" => &mut book.bid_levels,
+            _ => {
+                *book = TokenBook::default();
+                return;
+            }
+        };
+        update_level(levels, price, size);
+    }
+    refresh_book(book, timestamp);
+    let change = changes.last().expect("nonempty changes");
+    // The server's BBO is also a consistency check against missed levels.
+    // Do not retain apparently fillable depth when that check fails.
+    for (reported, actual) in [
+        (change.best_ask.as_deref(), book.best_ask),
+        (change.best_bid.as_deref(), book.best_bid),
+    ] {
+        if let Some(reported) = reported {
+            if valid_price(reported) != actual {
+                *book = TokenBook::default();
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +444,33 @@ mod resolution_scope_tests {
 
     const UP: &str = "up-token-current";
     const DOWN: &str = "down-token-current";
+
+    #[tokio::test]
+    async fn nested_price_changes_update_both_ladders_and_delete_empty_levels() {
+        let state: SharedMarketState = Arc::new(RwLock::new(MarketState::default()));
+        let (tx, _) = mpsc::channel(4);
+        let tokens = Some((UP.to_string(), DOWN.to_string()));
+        let snapshot = serde_json::json!({"event_type":"book","asset_id":UP,"timestamp":"1000",
+            "bids":[{"price":"0.48","size":"90"}],
+            "asks":[{"price":"0.50","size":"80"},{"price":"0.51","size":"70"}]});
+        handle_clob_message(&snapshot.to_string(), &state, &tx, &tokens).await;
+        let changes = serde_json::json!({"event_type":"price_change","timestamp":"1001","price_changes":[
+            {"asset_id":UP,"price":"0.50","size":"0","side":"SELL","best_bid":"0.49","best_ask":"0.51"},
+            {"asset_id":UP,"price":"0.49","size":"60","side":"BUY","best_bid":"0.49","best_ask":"0.51"}]});
+        handle_clob_message(&changes.to_string(), &state, &tx, &tokens).await;
+        let book = state.read().await.up_book.clone();
+        assert_eq!(book.best_ask, Some(0.51));
+        assert_eq!(book.best_bid, Some(0.49));
+        assert_eq!(book.ask_depth_up_to(0.50), 0.0);
+        assert_eq!(book.bid_depth, Some(150.0));
+        assert_eq!(book.last_update_ms, 1001);
+        // An old snapshot must not resurrect deleted liquidity.
+        handle_clob_message(&snapshot.to_string(), &state, &tx, &tokens).await;
+        assert_eq!(state.read().await.up_book.best_ask, Some(0.51));
+        clear_books(&state).await;
+        handle_clob_message(&changes.to_string(), &state, &tx, &tokens).await;
+        assert_eq!(state.read().await.up_book.last_update_ms, 0);
+    }
 
     async fn feed(json: &str) -> (bool, Option<ResolutionEvent>) {
         let ms: SharedMarketState = Arc::new(RwLock::new(MarketState::default()));
